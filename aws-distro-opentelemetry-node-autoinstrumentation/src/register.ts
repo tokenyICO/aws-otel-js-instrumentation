@@ -219,6 +219,7 @@ export const instrumentationConfigs: InstrumentationConfigMap = {
   },
   '@opentelemetry/instrumentation-aws-sdk': {
     suppressInternalInstrumentation: true,
+    sqsExtractContextPropagationFromPayload: true,
   },
   '@opentelemetry/instrumentation-mongoose': {
     suppressInternalInstrumentation: true,
