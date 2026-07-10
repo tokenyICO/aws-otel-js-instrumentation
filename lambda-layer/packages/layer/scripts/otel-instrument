@@ -28,14 +28,35 @@ _is_esm_handler() {
   fi
 }
 
-if _is_esm_handler || [[ ${HANDLER_IS_ESM} == true ]]; then
-  export NODE_OPTIONS="${NODE_OPTIONS} --import /opt/wrapper.js --experimental-loader=import-in-the-middle/hook.mjs"
+_get_node_runtime_version() {
+  local exec_env="${AWS_EXECUTION_ENV:-}"
+  if [[ $exec_env =~ nodejs([0-9]+)\.x ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "0"
+  fi
+}
+
+NODE_VERSION=$(_get_node_runtime_version)
+
+if _is_esm_handler || [[ ${HANDLER_IS_ESM} == true ]] || [[ $NODE_VERSION -ge 24 ]]; then
+  if [[ $NODE_VERSION -ge 20 ]]; then
+    # Node 20.6+ supports module.register() which allows selective module
+    # interception. This avoids the global ESM loader hook (--experimental-loader)
+    # which breaks ESM live bindings in bundled application code.
+    # See: https://github.com/nodejs/import-in-the-middle/issues/38
+    export NODE_OPTIONS="${NODE_OPTIONS} --import /opt/wrapper.mjs"
+  else
+    # Node 18.x does not support module.register(), fall back to the global
+    # --experimental-loader approach
+    export NODE_OPTIONS="${NODE_OPTIONS} --import /opt/wrapper.js --experimental-loader=import-in-the-middle/hook.mjs"
+  fi
   export HANDLER_IS_ESM=true
 else
   export NODE_OPTIONS="${NODE_OPTIONS} --require /opt/wrapper.js"
 fi
 
-export LAMBDA_RESOURCE_ATTRIBUTES="cloud.region=$AWS_REGION,cloud.provider=aws,faas.name=$AWS_LAMBDA_FUNCTION_NAME,faas.version=$AWS_LAMBDA_FUNCTION_VERSION,faas.instance=$AWS_LAMBDA_LOG_STREAM_NAME,aws.log.group.names=$AWS_LAMBDA_LOG_GROUP_NAME";
+export LAMBDA_RESOURCE_ATTRIBUTES="cloud.region=$AWS_REGION,cloud.provider=aws,cloud.platform=aws_lambda,faas.name=$AWS_LAMBDA_FUNCTION_NAME,faas.version=$AWS_LAMBDA_FUNCTION_VERSION,faas.instance=$AWS_LAMBDA_LOG_STREAM_NAME,aws.log.group.names=$AWS_LAMBDA_LOG_GROUP_NAME";
 
 
 # - If OTEL_EXPORTER_OTLP_PROTOCOL is not set by user, the default exporting protocol is http/protobuf.
@@ -68,7 +89,7 @@ fi
 
 # - Set the propagators
 if [[ -z "$OTEL_PROPAGATORS" ]]; then
-  export OTEL_PROPAGATORS="xray,tracecontext,baggage"
+  export OTEL_PROPAGATORS="baggage,tracecontext,xray"
 fi
 
 # - Set Application Signals configuration
@@ -76,8 +97,14 @@ if [ -z "${OTEL_AWS_APPLICATION_SIGNALS_ENABLED}" ]; then
     export OTEL_AWS_APPLICATION_SIGNALS_ENABLED="true";
 fi
 
+# - Disable otel metrics export by default
 if [ -z "${OTEL_METRICS_EXPORTER}" ]; then
     export OTEL_METRICS_EXPORTER="none";
+fi
+
+# - Disable logs exporter by default
+if [ -z "${OTEL_LOGS_EXPORTER}" ]; then
+    export OTEL_LOGS_EXPORTER="none";
 fi
 
 # - Append Lambda Resource Attributes to OTel Resource Attribute List

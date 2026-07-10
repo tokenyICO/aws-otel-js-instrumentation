@@ -1,0 +1,123 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+> **Note:** This CHANGELOG was created starting after version 0.7.0. Earlier changes are not documented here.
+
+For any change that affects end users of this package, please add an entry under the **Unreleased** section. Briefly summarize the change and provide the link to the PR. Example:
+
+- add GenAI attribute support for Amazon Bedrock models
+  ([#111](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/111))
+
+If your change does not need a CHANGELOG entry, add the "skip changelog" label to your PR.
+
+## Unreleased
+
+## v0.12.0 - 2026-06-18
+
+- feat: add ServiceEvents deep observability instrumentation — endpoint, function-call,
+  deployment, and incident-snapshot telemetry with profiling support
+  ([#467](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/467))
+- fix: AWS SDK v3 span creation when using `@smithy/core` >= 3.24.0 (`@smithy/smithy-client` >= 4.13.0)
+  by backporting the upstream aws-sdk instrumentation fix via patch
+  ([#467](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/467))
+- Fix(lambda-layer): CompactConsoleLogRecordExporter output with CloudWatch OTLP backend schema.
+  Field renames: `timestamp` → `timeUnixNano`, `observedTimestamp` → `observedTimeUnixNano`,
+  `instrumentationScope` → `scope`, `traceFlags` → `flags`. Attribute values preserve native
+  types.
+  ([#392](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/392))
+- (**Breaking Change**) refactor: remove BedrockRuntime, SecretsManager, StepFunction, SNS instrumentation patches.
+  ([#446](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/446))
+- feat: add Bedrock AgentCore data plane instrumentation
+  ([#455](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/455))
+- suppress /ping endpoint instrumentation for HTTP libraries in AgentCore
+  ([#453](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/453))
+- feat(agent-observability): remove LLO handler from OTLP span exporter
+  ([#464](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/464))
+- feat: add Dynamic Instrumentation — opt-in, on-demand runtime snapshot capture.
+  ([#466](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/466))
+
+## v0.11.0 - 2026-04-30
+
+- Support environment-configured endpoint visibility for HTTP operation names
+  ([#388](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/388))
+- enhancement(agent-observability): add undici to default enabled instrumentations
+  ([#421](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/421))
+- feat: auto-detect and mutually exclude native vs third-party agentic instrumentors
+  ([#417](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/417))
+- fix(agent-observability): fall back to OTEL_EXPORTER_OTLP_ENDPOINT for unsampled spans
+  ([#420](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/420))
+- feat(agent-observability): add GenAiNestedClientSpanProcessor to deduplicate nested CLIENT spans
+  ([#413](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/413))
+- feat: add BaggageSpanProcessor by default with OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS support
+  ([#415](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/415))
+- feat(agent-observability): register custom instrumentations in OTEL_NODE_ENABLED_INSTRUMENTATIONS default
+  ([#414](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/414))
+- fix: Respect OTEL_EXPORTER_OTLP_ENDPOINT in agent observability endpoint configuration
+  ([#411](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/411))
+- feat(llo-handler): add gen_ai.input.messages, gen_ai.output.messages, and gen_ai.system_instructions support
+  ([#412](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/412))
+- feat(instrumentation-openai-agents): Add native OpenAI Agents instrumentation support
+  ([#401](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/401))
+- feat(instrumentation-vercel-ai): Add native Vercel AI instrumentation support
+  ([#394](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/394))
+- feat(instrumentation-langchain): Add native LangChain instrumentation support
+  ([#391](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/391))
+
+## v0.10.0 - 2026-04-03
+
+- Fix UnknownRemoteService/UnknownRemoteOperation for Next.js fetch by supporting new HTTP semantic conventions
+  (`server.address`, `server.port`, `http.request.method`, `url.full`, `url.path`) as fallbacks
+  ([#366](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/366))
+
+## v0.9.0 - 2026-02-11
+
+### Breaking Changes
+
+- Update minimum Node.js version requirement from 14 to 18, aligning with upstream OpenTelemetry JS support
+  ([#312](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/312))
+- Upgrade OpenTelemetry dependencies to 2.x (core packages 2.5.0, experimental packages 0.211.0)
+  ([#314](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/314))
+  ([#315](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/347))
+
+### Enhancements
+
+- Add Service and Environment dimensions to EMF metrics when `OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS` is enabled.
+  Supports platform-aware environment defaults (Lambda, EC2, ECS, EKS).
+  ([#299](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/299))
+- Add support for Node.js 24
+  ([#352](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/352))
+
+### Maintenance
+
+- Update AWS SDK to 3.982.0 to fix @smithy/config-resolver vulnerability (GHSA-6475-r3vj-m8vf) and CVE-2026-0994
+  ([#312](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/312))
+  ([#346](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/346))
+
+### Bugfixes
+
+- Fix Lambda layer AWS SDK instrumentation not working after OTel 2.x upgrade by externalizing require-in-the-middle from webpack bundle
+  ([#349](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/349))
+- Fix UDP exporter e2e test by updating sample app to OTel 2.x dependencies
+  ([#350](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/350))
+- Use `module.register` instead of `--experimental-loader` for Lambda ESM handlers
+  ([#359](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/359))
+
+## v0.8.1 - 2025-12-17
+
+### Bugfixes
+
+- Fix issue where UDP Exporter throws error in async callback, which isn't caught
+  ([#289](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/259))
+
+## v0.8.0 - 2025-10-08
+
+### Enhancements
+
+- Support X-Ray Trace Id extraction from Lambda Context object, and respect user-configured OTEL_PROPAGATORS in AWS Lamdba instrumentation
+  ([#259](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/259))
+
+### Bugfixes
+
+- Fix issue where UDP Exporter throws error in async callback, which isn't caught
+  ([#289](https://github.com/aws-observability/aws-otel-js-instrumentation/pull/259))

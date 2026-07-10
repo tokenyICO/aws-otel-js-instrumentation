@@ -5,13 +5,19 @@ import {
   Attributes,
   diag,
   Context as OtelContext,
+  context as otelContext,
   trace,
+  context,
   propagation,
   Span,
   Tracer,
   AttributeValue,
   TextMapSetter,
+  INVALID_SPAN_CONTEXT,
+  SpanStatusCode,
+  ROOT_CONTEXT,
 } from '@opentelemetry/api';
+import * as api from '@opentelemetry/api';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { Instrumentation } from '@opentelemetry/instrumentation';
 import { AwsInstrumentation, NormalizedRequest, NormalizedResponse } from '@opentelemetry/instrumentation-aws-sdk';
@@ -19,16 +25,29 @@ import { AwsLambdaInstrumentation, AwsLambdaInstrumentationConfig } from '@opent
 import { expect } from 'expect';
 import { AWS_ATTRIBUTE_KEYS } from '../../src/aws-attribute-keys';
 import { RequestMetadata, ServiceExtension } from '../../src/third-party/otel/aws/services/ServiceExtension';
-import { applyInstrumentationPatches, customExtractor, headerGetter } from './../../src/patches/instrumentation-patch';
+import {
+  applyInstrumentationPatches,
+  AWSXRAY_TRACE_ID_HEADER_CAPITALIZED,
+  customExtractor,
+  ExtendedAwsLambdaInstrumentation,
+  headerGetter,
+  SKIP_CREDENTIAL_CAPTURE_KEY,
+} from './../../src/patches/instrumentation-patch';
 import * as sinon from 'sinon';
 import { AWSXRAY_TRACE_ID_HEADER, AWSXRayPropagator } from '@opentelemetry/propagator-aws-xray';
 import { Context } from 'aws-lambda';
-import { SinonStub } from 'sinon';
 import { Lambda } from '@aws-sdk/client-lambda';
 import * as nock from 'nock';
 import { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { getTestSpans } from '@opentelemetry/contrib-test-utils';
-import { instrumentationConfigs } from '../../src/register';
+import * as opentelemetry from '@opentelemetry/sdk-node';
+import { LoggerProvider } from '@opentelemetry/api-logs';
+import { STS } from '@aws-sdk/client-sts';
+import { getPropagator } from '@opentelemetry/auto-configuration-propagators';
+import { BatchSpanProcessor, InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import * as path from 'path';
 
 // It is assumed that bedrock.test.ts has already registered the
 // necessary instrumentations for testing by calling:
@@ -48,20 +67,32 @@ const _BEDROCK_DATASOURCE_ID: string = 'DataSourceId';
 const _BEDROCK_GUARDRAIL_ID: string = 'GuardrailId';
 const _BEDROCK_GUARDRAIL_ARN: string = 'arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123';
 const _BEDROCK_KNOWLEDGEBASE_ID: string = 'KnowledgeBaseId';
-const _GEN_AI_SYSTEM: string = 'aws.bedrock';
 const _GEN_AI_REQUEST_MODEL: string = 'genAiReuqestModelId';
+const _STREAM_ARN: string = 'arn:aws:kinesis:us-west-2:123456789012:stream/testStream';
+const _TABLE_ARN: string = 'arn:aws:dynamodb:us-west-2:123456789012:table/testTable';
 
 const mockHeaders = {
   'x-test-header': 'test-value',
   'content-type': 'application/json',
 };
 
-const UNPATCHED_INSTRUMENTATIONS: Instrumentation[] = getNodeAutoInstrumentations(instrumentationConfigs);
-
-const PATCHED_INSTRUMENTATIONS: Instrumentation[] = getNodeAutoInstrumentations(instrumentationConfigs);
-applyInstrumentationPatches(PATCHED_INSTRUMENTATIONS);
+let UNPATCHED_INSTRUMENTATIONS: Instrumentation[];
+let PATCHED_INSTRUMENTATIONS: Instrumentation[];
+let instrumentationConfigs: Record<string, any>;
 
 describe('InstrumentationPatchTest', () => {
+  before(() => {
+    const stub = sinon.stub(opentelemetry.NodeSDK.prototype, 'start');
+    const register = require('../../src/register');
+    stub.restore();
+    instrumentationConfigs = register.instrumentationConfigs;
+    UNPATCHED_INSTRUMENTATIONS = getNodeAutoInstrumentations(instrumentationConfigs);
+    PATCHED_INSTRUMENTATIONS = getNodeAutoInstrumentations(instrumentationConfigs);
+    applyInstrumentationPatches(PATCHED_INSTRUMENTATIONS);
+
+    propagation.disable();
+    propagation.setGlobalPropagator(getPropagator());
+  });
   it('SanityTestUnpatchedAwsSdkInstrumentation', () => {
     const awsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(awsSdkInstrumentation);
@@ -73,19 +104,21 @@ describe('InstrumentationPatchTest', () => {
     expect(services.has('DynamoDB')).toBeTruthy();
     expect(services.has('S3')).toBeTruthy();
     expect(services.has('Kinesis')).toBeTruthy();
-    // From patching but shouldn't be applied
-    expect(services.get('SecretsManager')).toBeFalsy();
-    expect(services.get('SFN')).toBeFalsy();
+    expect(services.has('SecretsManager')).toBeTruthy();
+    expect(services.has('SFN')).toBeTruthy();
     expect(services.get('SNS')._requestPreSpanHook).toBeFalsy();
     expect(services.get('SNS').requestPreSpanHook).toBeTruthy();
     expect(services.get('Lambda')._requestPreSpanHook).toBeFalsy();
     expect(services.get('Lambda').requestPreSpanHook).toBeTruthy();
     expect(services.get('SQS')._requestPreSpanHook).toBeFalsy();
     expect(services.get('SQS').requestPreSpanHook).toBeTruthy();
+    expect(services.get('Kinesis')._requestPreSpanHook).toBeFalsy();
+    expect(services.get('Kinesis').requestPreSpanHook).toBeTruthy();
+    expect(services.get('BedrockRuntime')).toBeTruthy();
+    // Bedrock, BedrockAgent, BedrockAgentRuntime are added via our patches
     expect(services.has('Bedrock')).toBeFalsy();
     expect(services.has('BedrockAgent')).toBeFalsy();
     expect(services.get('BedrockAgentRuntime')).toBeFalsy();
-    expect(services.get('BedrockRuntime')).toBeFalsy();
   });
 
   it('PatchesAwsSdkInstrumentation', () => {
@@ -95,26 +128,31 @@ describe('InstrumentationPatchTest', () => {
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
     const services: Map<string, any> = (awsSdkInstrumentation as AwsInstrumentation).servicesExtensions?.services;
-    // Not from patching
-    expect(services.has('SQS')).toBeTruthy();
-    expect(services.has('SNS')).toBeTruthy();
-    expect(services.has('DynamoDB')).toBeTruthy();
-    expect(services.has('Lambda')).toBeTruthy();
+    // Services supported by upstream
     expect(services.has('S3')).toBeTruthy();
-    expect(services.has('Kinesis')).toBeTruthy();
-    // From patching
+    expect(services.has('SNS')).toBeTruthy();
     expect(services.has('SecretsManager')).toBeTruthy();
     expect(services.has('SFN')).toBeTruthy();
-    expect(services.get('SNS')._requestPreSpanHook).toBeTruthy();
-    expect(services.get('SNS').requestPreSpanHook).toBeTruthy();
-    expect(services.get('Lambda')._requestPreSpanHook).toBeTruthy();
-    expect(services.get('Lambda').requestPreSpanHook).toBeTruthy();
+
+    // Services in upstream that we patch
+    expect(services.has('SQS')).toBeTruthy();
     expect(services.get('SQS')._requestPreSpanHook).toBeTruthy();
     expect(services.get('SQS').requestPreSpanHook).toBeTruthy();
+    expect(services.has('DynamoDB')).toBeTruthy();
+    expect(services.has('Lambda')).toBeTruthy();
+    expect(services.get('Lambda')._requestPreSpanHook).toBeTruthy();
+    expect(services.get('Lambda').requestPreSpanHook).toBeTruthy();
+    expect(services.has('Kinesis')).toBeTruthy();
+    expect(services.get('Kinesis')._requestPreSpanHook).toBeTruthy();
+    expect(services.get('Kinesis').requestPreSpanHook).toBeTruthy();
+    expect(services.has('BedrockRuntime')).toBeTruthy();
+    expect(services.get('BedrockRuntime')._requestPreSpanHook).toBeTruthy();
+
+    // Services not in upstream at all
     expect(services.has('Bedrock')).toBeTruthy();
     expect(services.has('BedrockAgent')).toBeTruthy();
     expect(services.get('BedrockAgentRuntime')).toBeTruthy();
-    expect(services.get('BedrockRuntime')).toBeTruthy();
+
     // Sanity check
     expect(services.has('InvalidService')).toBeFalsy();
   });
@@ -133,15 +171,6 @@ describe('InstrumentationPatchTest', () => {
     expect(sqsAttributes[AWS_ATTRIBUTE_KEYS.AWS_SQS_QUEUE_NAME]).toBeUndefined();
   });
 
-  it('SNS without patching', () => {
-    const unpatchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
-    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(unpatchedAwsSdkInstrumentation);
-    expect(() => doExtractSNSAttributes(services)).not.toThrow();
-
-    const snsAttributes = doExtractSNSAttributes(services);
-    expect(snsAttributes[AWS_ATTRIBUTE_KEYS.AWS_SNS_TOPIC_ARN]).toBeUndefined();
-  });
-
   it('Lambda without patching', () => {
     const unpatchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(unpatchedAwsSdkInstrumentation);
@@ -153,16 +182,19 @@ describe('InstrumentationPatchTest', () => {
     expect(lambdaAttributes[AWS_ATTRIBUTE_KEYS.AWS_LAMBDA_FUNCTION_ARN]).toBeUndefined();
   });
 
-  it('SFN without patching', () => {
-    const unpatchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
-    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(unpatchedAwsSdkInstrumentation);
-    expect(() => doExtractSFNAttributes(services)).toThrow();
+  it('SFN upstream attributes', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const requestSFNAttributes: Attributes = doExtractSFNAttributes(services);
+    expect(requestSFNAttributes[AWS_ATTRIBUTE_KEYS.AWS_STEPFUNCTIONS_STATEMACHINE_ARN]).toEqual(_STATE_MACHINE_ARN);
+    expect(requestSFNAttributes[AWS_ATTRIBUTE_KEYS.AWS_STEPFUNCTIONS_ACTIVITY_ARN]).toEqual(_ACTIVITY_ARN);
   });
 
-  it('SecretsManager without patching', () => {
-    const unpatchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
-    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(unpatchedAwsSdkInstrumentation);
-    expect(() => doExtractSecretsManagerAttributes(services)).toThrow();
+  it('SecretsManager upstream attributes', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const requestSecretsManagerAttributes: Attributes = doExtractSecretsManagerAttributes(services);
+    expect(requestSecretsManagerAttributes[AWS_ATTRIBUTE_KEYS.AWS_SECRETSMANAGER_SECRET_ARN]).toBe(_SECRETS_ARN);
   });
 
   it('Bedrock without patching', () => {
@@ -171,10 +203,17 @@ describe('InstrumentationPatchTest', () => {
     expect(() => doExtractBedrockAttributes(services, 'Bedrock')).toThrow();
   });
 
-  it('SNS with patching', () => {
+  it('Kinesis without patching', () => {
+    const unpatchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(UNPATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(unpatchedAwsSdkInstrumentation);
+    expect(() => doExtractKinesisAttributes(services)).not.toThrow();
+    const kinesisAttributes: Attributes = doExtractKinesisAttributes(services);
+    expect(kinesisAttributes).not.toHaveProperty(AWS_ATTRIBUTE_KEYS.AWS_KINESIS_STREAM_ARN);
+  });
+
+  it('SNS upstream attributes', () => {
     const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
-
     const snsAttributes = doExtractSNSAttributes(services);
     expect(snsAttributes[AWS_ATTRIBUTE_KEYS.AWS_SNS_TOPIC_ARN]).toBe(_TOPIC_ARN);
   });
@@ -205,24 +244,18 @@ describe('InstrumentationPatchTest', () => {
     expect(responseLambdaAttributes[AWS_ATTRIBUTE_KEYS.AWS_LAMBDA_FUNCTION_ARN]).toEqual(_FUNCTION_ARN);
   });
 
-  it('SFN with patching', () => {
+  it('Kinesis with patching', () => {
     const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
-    const requestSFNAttributes: Attributes = doExtractSFNAttributes(services);
-    expect(requestSFNAttributes[AWS_ATTRIBUTE_KEYS.AWS_STEPFUNCTIONS_STATEMACHINE_ARN]).toEqual(_STATE_MACHINE_ARN);
-    expect(requestSFNAttributes[AWS_ATTRIBUTE_KEYS.AWS_STEPFUNCTIONS_ACTIVITY_ARN]).toEqual(_ACTIVITY_ARN);
+    const requestKinesisAttributes: Attributes = doExtractKinesisAttributes(services);
+    expect(requestKinesisAttributes[AWS_ATTRIBUTE_KEYS.AWS_KINESIS_STREAM_ARN]).toEqual(_STREAM_ARN);
   });
 
-  it('SecretsManager with patching', () => {
+  it('DynamoDB with patching', () => {
     const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
-    const requestSecretsManagerAttributes: Attributes = doExtractSecretsManagerAttributes(services);
-
-    expect(requestSecretsManagerAttributes[AWS_ATTRIBUTE_KEYS.AWS_SECRETSMANAGER_SECRET_ARN]).toBe(_SECRETS_ARN);
-
-    const responseHookSecretsManagerAttributes = doResponseHookSecretsManager(services);
-
-    expect(responseHookSecretsManagerAttributes[AWS_ATTRIBUTE_KEYS.AWS_SECRETSMANAGER_SECRET_ARN]).toBe(_SECRETS_ARN);
+    const responseDynamoDbAttributes: Attributes = doResponseHookDynamoDb(services);
+    expect(responseDynamoDbAttributes[AWS_ATTRIBUTE_KEYS.AWS_DYNAMODB_TABLE_ARN]).toEqual(_TABLE_ARN);
   });
 
   it('Bedrock with patching', () => {
@@ -304,17 +337,162 @@ describe('InstrumentationPatchTest', () => {
     expect(Object.entries(bedrockAttributesAfterResponse).length).toBe(0);
   });
 
-  it('Bedrock Runtime with patching', () => {
+  it('Bedrock Runtime upstream attributes - InvokeModel', () => {
     const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
     const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
-    const bedrockAttributes: Attributes = doExtractBedrockAttributes(services, 'BedrockRuntime');
+    const serviceExtension: any = services.get('BedrockRuntime');
+    expect(serviceExtension).toBeTruthy();
 
-    expect(Object.entries(bedrockAttributes).length).toBe(2);
-    expect(bedrockAttributes['gen_ai.system']).toEqual(_GEN_AI_SYSTEM);
-    expect(bedrockAttributes['gen_ai.request.model']).toEqual(_GEN_AI_REQUEST_MODEL);
+    const requestMetadata = serviceExtension.requestPreSpanHook(
+      {
+        serviceName: 'BedrockRuntime',
+        commandName: 'InvokeModel',
+        commandInput: {
+          modelId: 'anthropic.claude-v2:1',
+          body: JSON.stringify({
+            max_tokens: 1000,
+            temperature: 0.7,
+            top_p: 0.9,
+            stop_sequences: ['Human:'],
+          }),
+        },
+      },
+      {},
+      diag
+    );
+    expect(requestMetadata.spanAttributes['gen_ai.system']).toEqual('aws.bedrock');
+    expect(requestMetadata.spanAttributes['gen_ai.request.model']).toEqual('anthropic.claude-v2:1');
+    expect(requestMetadata.spanAttributes['gen_ai.request.max_tokens']).toEqual(1000);
+    expect(requestMetadata.spanAttributes['gen_ai.request.temperature']).toEqual(0.7);
+    expect(requestMetadata.spanAttributes['gen_ai.request.top_p']).toEqual(0.9);
+    expect(requestMetadata.spanAttributes['gen_ai.request.stop_sequences']).toEqual(['Human:']);
+  });
 
-    const bedrockAttributesAfterResponse: Attributes = doResponseHookBedrock(services, 'BedrockRuntime');
-    expect(Object.entries(bedrockAttributesAfterResponse).length).toBe(0);
+  it('Bedrock Runtime upstream attributes - Converse', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const serviceExtension: any = services.get('BedrockRuntime');
+    expect(serviceExtension).toBeTruthy();
+
+    // Test Converse API (model-agnostic, sets operation name)
+    const requestMetadata = serviceExtension.requestPreSpanHook(
+      {
+        serviceName: 'BedrockRuntime',
+        commandName: 'Converse',
+        commandInput: {
+          modelId: 'anthropic.claude-v2:1',
+          inferenceConfig: {
+            maxTokens: 500,
+            temperature: 0.8,
+            topP: 0.95,
+            stopSequences: ['END'],
+          },
+        },
+      },
+      {},
+      diag
+    );
+    expect(requestMetadata.spanAttributes['gen_ai.system']).toEqual('aws.bedrock');
+    expect(requestMetadata.spanAttributes['gen_ai.operation.name']).toEqual('chat');
+    expect(requestMetadata.spanAttributes['gen_ai.request.model']).toEqual('anthropic.claude-v2:1');
+    expect(requestMetadata.spanAttributes['gen_ai.request.max_tokens']).toEqual(500);
+    expect(requestMetadata.spanAttributes['gen_ai.request.temperature']).toEqual(0.8);
+    expect(requestMetadata.spanAttributes['gen_ai.request.top_p']).toEqual(0.95);
+    expect(requestMetadata.spanAttributes['gen_ai.request.stop_sequences']).toEqual(['END']);
+    expect(requestMetadata.spanName).toEqual('chat anthropic.claude-v2:1');
+  });
+
+  it('Bedrock Runtime ai21.jamba patch - InvokeModel', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const serviceExtension: any = services.get('BedrockRuntime');
+    expect(serviceExtension).toBeTruthy();
+    expect(serviceExtension._requestPreSpanHook).toBeTruthy();
+
+    const requestMetadata = serviceExtension.requestPreSpanHook(
+      {
+        serviceName: 'BedrockRuntime',
+        commandName: 'InvokeModel',
+        commandInput: {
+          modelId: 'ai21.jamba-1-5-large-v1:0',
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: 'test' }],
+            max_tokens: 512,
+            temperature: 0.6,
+            top_p: 0.8,
+          }),
+        },
+      },
+      {},
+      diag
+    );
+    expect(requestMetadata.spanAttributes['gen_ai.system']).toEqual('aws.bedrock');
+    expect(requestMetadata.spanAttributes['gen_ai.request.model']).toEqual('ai21.jamba-1-5-large-v1:0');
+    expect(requestMetadata.spanAttributes['gen_ai.request.max_tokens']).toEqual(512);
+    expect(requestMetadata.spanAttributes['gen_ai.request.temperature']).toEqual(0.6);
+    expect(requestMetadata.spanAttributes['gen_ai.request.top_p']).toEqual(0.8);
+  });
+
+  it('Bedrock Runtime ai21.jamba patch - responseHook', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const serviceExtension: any = services.get('BedrockRuntime');
+
+    const mockResponseBody = {
+      usage: { prompt_tokens: 21, completion_tokens: 24 },
+      choices: [{ finish_reason: 'stop' }],
+    };
+    const response: Partial<NormalizedResponse> = {
+      data: {
+        body: new TextEncoder().encode(JSON.stringify(mockResponseBody)),
+      },
+      request: {
+        commandInput: { modelId: 'ai21.jamba-1-5-large-v1:0' },
+        commandName: 'InvokeModel',
+        serviceName: 'BedrockRuntime',
+      },
+    };
+
+    const spanAttributes: Attributes = {};
+    const mockSpan: any = {
+      setAttribute: (key: string, value: any) => {
+        spanAttributes[key] = value;
+      },
+      isRecording: () => true,
+    };
+
+    serviceExtension.responseHook(response, mockSpan, {}, {});
+
+    expect(spanAttributes['gen_ai.usage.input_tokens']).toEqual(21);
+    expect(spanAttributes['gen_ai.usage.output_tokens']).toEqual(24);
+    expect(spanAttributes['gen_ai.response.finish_reasons']).toEqual(['stop']);
+  });
+
+  it('Bedrock Runtime patch preserves responseHook return value for streaming', () => {
+    const patchedAwsSdkInstrumentation: AwsInstrumentation = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS);
+    const services: Map<string, any> = extractServicesFromAwsSdkInstrumentation(patchedAwsSdkInstrumentation);
+    const serviceExtension: any = services.get('BedrockRuntime');
+
+    const mockStream = (async function* () {
+      yield { messageStop: { stopReason: 'end_turn' } };
+      yield { metadata: { usage: { inputTokens: 10, outputTokens: 5 } } };
+    })();
+    const response: Partial<NormalizedResponse> = {
+      data: { stream: mockStream },
+      request: {
+        commandInput: { modelId: 'anthropic.claude-v2:1' },
+        commandName: 'ConverseStream',
+        serviceName: 'BedrockRuntime',
+      },
+    };
+
+    const mockSpan: any = {
+      setAttribute: () => mockSpan,
+      isRecording: () => true,
+    };
+
+    const result = serviceExtension.responseHook(response, mockSpan, {}, {});
+    expect(result).toBeDefined();
   });
 
   it('Lambda with custom eventContextExtractor patching', () => {
@@ -331,6 +509,14 @@ describe('InstrumentationPatchTest', () => {
     );
     expect(filteredInstrumentations.length).toEqual(1);
     return filteredInstrumentations[0] as AwsInstrumentation;
+  }
+
+  function extractAwsLambdaInstrumentation(instrumentations: Instrumentation[]): AwsLambdaInstrumentation {
+    const filteredInstrumentations: Instrumentation[] = instrumentations.filter(
+      instrumentation => instrumentation.instrumentationName === '@opentelemetry/instrumentation-aws-lambda'
+    );
+    expect(filteredInstrumentations.length).toEqual(1);
+    return filteredInstrumentations[0] as AwsLambdaInstrumentation;
   }
 
   function extractServicesFromAwsSdkInstrumentation(awsSdkInstrumentation: AwsInstrumentation): Map<string, any> {
@@ -430,6 +616,18 @@ describe('InstrumentationPatchTest', () => {
     return doExtractAttributes(services, serviceName, params);
   }
 
+  function doExtractKinesisAttributes(services: Map<string, ServiceExtension>): Attributes {
+    const serviceName: string = 'Kinesis';
+    const params: NormalizedRequest = {
+      serviceName: serviceName,
+      commandName: 'mockCommandName',
+      commandInput: {
+        StreamARN: _STREAM_ARN,
+      },
+    };
+    return doExtractAttributes(services, serviceName, params);
+  }
+
   function doExtractAttributes(
     services: Map<string, ServiceExtension>,
     serviceName: string,
@@ -441,22 +639,6 @@ describe('InstrumentationPatchTest', () => {
     }
     const requestMetadata: RequestMetadata = serviceExtension.requestPreSpanHook(requestInput, {}, diag);
     return requestMetadata.spanAttributes || {};
-  }
-
-  function doResponseHookSecretsManager(services: Map<string, ServiceExtension>): Attributes {
-    const results: Partial<NormalizedResponse> = {
-      data: {
-        ARN: _SECRETS_ARN,
-      },
-
-      request: {
-        commandInput: {},
-        commandName: 'dummy_operation',
-        serviceName: 'SecretsManager',
-      },
-    };
-
-    return doResponseHook(services, 'SecretsManager', results as NormalizedResponse);
   }
 
   function doResponseHookLambda(services: Map<string, ServiceExtension>): Attributes {
@@ -474,6 +656,23 @@ describe('InstrumentationPatchTest', () => {
     };
 
     return doResponseHook(services, 'Lambda', results as NormalizedResponse);
+  }
+
+  function doResponseHookDynamoDb(services: Map<string, ServiceExtension>): Attributes {
+    const results: Partial<NormalizedResponse> = {
+      data: {
+        Table: {
+          TableArn: _TABLE_ARN,
+        },
+      },
+      request: {
+        commandInput: {},
+        commandName: 'dummy_operation',
+        serviceName: 'DynamoDB',
+      },
+    };
+
+    return doResponseHook(services, 'DynamoDB', results as NormalizedResponse);
   }
 
   function doResponseHookBedrock(
@@ -535,34 +734,198 @@ describe('InstrumentationPatchTest', () => {
     let lambda: Lambda;
     const region = 'us-east-1';
 
-    it('overridden _getV3SmithyClientSendPatch updates MiddlewareStack', async () => {
-      const mockedMiddlewareStackInternal: any = [];
-      const mockedMiddlewareStack = {
-        add: (arg1: any, arg2: any) => mockedMiddlewareStackInternal.push([arg1, arg2]),
-      };
-      const send = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS)
-        ['_getV3SmithyClientSendPatch']((...args: unknown[]) => Promise.resolve())
-        .bind({ middlewareStack: mockedMiddlewareStack });
-      sinon
-        .stub(AWSXRayPropagator.prototype, 'inject')
-        .callsFake((context: OtelContext, carrier: unknown, setter: TextMapSetter) => {
-          (carrier as any)['isCarrierModified'] = 'carrierIsModified';
+    describe('overridden _getV3SmithyClientSendPatch updates MiddlewareStack', async () => {
+      let mockedMiddlewareStackInternal: any;
+      let mockedMiddlewareStack;
+      let middlewareArgsHeader: any;
+      const testXrayTraceHeader = 'test-xray-trace-header';
+
+      beforeEach(async () => {
+        // Clear environment variables before each test
+        mockedMiddlewareStackInternal = [];
+        mockedMiddlewareStack = {
+          add: (arg1: any, arg2: any) => mockedMiddlewareStackInternal.push([arg1, arg2]),
+        };
+        const mockConfig = {
+          credentials: () => Promise.resolve({ accessKeyId: 'test-access-key' }),
+          region: () => Promise.resolve('us-west-2'),
+        };
+        const send = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS)
+          ['_getV3SmithyClientSendPatch'](undefined, (...args: unknown[]) => Promise.resolve())
+          .bind({ middlewareStack: mockedMiddlewareStack, config: mockConfig });
+
+        middlewareArgsHeader = {
+          request: {
+            headers: {},
+          },
+        };
+
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        await send({}, null);
+      });
+
+      afterEach(() => {
+        sinon.restore();
+      });
+
+      it('Updates trace header casing when AWSXRayPropagator injects trace header successfully', async () => {
+        sinon
+          .stub(AWSXRayPropagator.prototype, 'inject')
+          .callsFake((context: OtelContext, carrier: unknown, setter: TextMapSetter) => {
+            (carrier as any)['isCarrierModified'] = 'carrierIsModified';
+            (carrier as any)[AWSXRAY_TRACE_ID_HEADER] = testXrayTraceHeader;
+          });
+        await mockedMiddlewareStackInternal[0][0]((arg: any) => Promise.resolve(), null)(middlewareArgsHeader);
+
+        expect(middlewareArgsHeader.request.headers['isCarrierModified']).toEqual('carrierIsModified');
+        expect(middlewareArgsHeader.request.headers).not.toHaveProperty(AWSXRAY_TRACE_ID_HEADER);
+        expect(middlewareArgsHeader.request.headers).toHaveProperty(AWSXRAY_TRACE_ID_HEADER_CAPITALIZED);
+        expect(middlewareArgsHeader.request.headers[AWSXRAY_TRACE_ID_HEADER_CAPITALIZED]).toEqual(testXrayTraceHeader);
+
+        expect(mockedMiddlewareStackInternal[0][1].name).toEqual('_adotInjectXrayContextMiddleware');
+      });
+
+      it('Does not set trace header when AWSXRayPropagator does not inject trace header', async () => {
+        const invalidContext: OtelContext = {
+          getValue: (key: symbol) => ({
+            spanContext: () => INVALID_SPAN_CONTEXT,
+          }),
+          setValue: (key: symbol, value: unknown) => invalidContext,
+          deleteValue: (key: symbol) => invalidContext,
+        };
+
+        sinon.stub(context, 'active').returns(invalidContext);
+
+        await mockedMiddlewareStackInternal[0][0]((arg: any) => Promise.resolve(), null)(middlewareArgsHeader);
+
+        expect(middlewareArgsHeader.request.headers).not.toHaveProperty(AWSXRAY_TRACE_ID_HEADER);
+        expect(middlewareArgsHeader.request.headers).not.toHaveProperty(AWSXRAY_TRACE_ID_HEADER_CAPITALIZED);
+
+        expect(mockedMiddlewareStackInternal[0][1].name).toEqual('_adotInjectXrayContextMiddleware');
+      });
+
+      it('Add cross account information span attributes from STS credentials', async () => {
+        const mockSpan = { setAttribute: sinon.stub() };
+        sinon.stub(trace, 'getSpan').returns(mockSpan as unknown as Span);
+        const credentialsMiddlewareArgs: any = {};
+        await mockedMiddlewareStackInternal[1][0]((arg: any) => Promise.resolve(arg), null)(credentialsMiddlewareArgs);
+        expect(mockedMiddlewareStackInternal[1][1].name).toEqual('_adotExtractSignerCredentials');
+        expect(
+          mockSpan.setAttribute.calledWith(AWS_ATTRIBUTE_KEYS.AWS_AUTH_ACCOUNT_ACCESS_KEY, 'test-access-key')
+        ).toBeTruthy();
+        expect(mockSpan.setAttribute.calledWith(AWS_ATTRIBUTE_KEYS.AWS_AUTH_REGION, 'us-west-2')).toBeTruthy();
+      });
+
+      it('Skips credential extraction with non-injectable NoOp context', async () => {
+        let credentialsProviderCallCount = 0;
+        const NoOpContext = Object.create(ROOT_CONTEXT);
+        NoOpContext.setValue = function () {
+          return this;
+        };
+        NoOpContext.deleteValue = function () {
+          return this;
+        };
+
+        // Create a mock Span object since Span is no longer exported as a value in OTel 2.x
+        const mockSpan = {
+          setAttribute: sinon.stub(),
+          setAttributes: sinon.stub(),
+          addEvent: sinon.stub(),
+          addLink: sinon.stub(),
+          addLinks: sinon.stub(),
+          setStatus: sinon.stub(),
+          updateName: sinon.stub(),
+          end: sinon.stub(),
+          isRecording: sinon.stub().returns(true),
+          recordException: sinon.stub(),
+          spanContext: sinon
+            .stub()
+            .returns({ traceId: '00000000000000000000000000000001', spanId: '0000000000000001', traceFlags: 0 }),
+        } as unknown as Span;
+        const ctx = trace.setSpan(NoOpContext, mockSpan);
+
+        sinon.stub(otelContext, 'active').returns(ctx);
+        sinon.stub(trace, 'getSpan').returns(mockSpan);
+
+        const middlewareStack: any[] = [];
+        const recursiveSdkSend = extractAwsSdkInstrumentation(PATCHED_INSTRUMENTATIONS)
+          ['_getV3SmithyClientSendPatch'](undefined, () => Promise.resolve())
+          .bind({
+            middlewareStack: { add: (middleware: any, config: any) => middlewareStack.push([middleware, config]) },
+            config: {
+              // Credentials provider that recursively calls SDK (simulates STS)
+              credentials: async () => {
+                credentialsProviderCallCount++;
+                await middlewareStack[1][0](() => Promise.resolve(), null)({});
+                return { accessKeyId: 'test-access-key' };
+              },
+              region: () => Promise.resolve('us-west-2'),
+            },
+          });
+
+        // Initial SDK call triggers middleware setup
+        await recursiveSdkSend({}, null);
+
+        // Execute credentials extraction middleware
+        await middlewareStack[1][0](() => Promise.resolve(), null)({});
+
+        expect(credentialsProviderCallCount).toBe(0);
+        expect(
+          (mockSpan.setAttribute as sinon.SinonStub).calledWith(
+            AWS_ATTRIBUTE_KEYS.AWS_AUTH_ACCOUNT_ACCESS_KEY,
+            'test-access-key'
+          )
+        ).toBeFalsy();
+      });
+    });
+
+    it('prevents recursion when credentials provider makes STS calls', async () => {
+      let credentialsCallCount = 0;
+      let skipCredentialCaptureValue = false;
+
+      // Create recursive credentials provider
+      const recursiveCredentialsProvider = async (): Promise<any> => {
+        credentialsCallCount++;
+        if (otelContext.active().getValue(SKIP_CREDENTIAL_CAPTURE_KEY)) {
+          skipCredentialCaptureValue = true;
+        }
+
+        const credentialsStsClient = new STS({
+          region: 'us-east-1',
+          credentials: recursiveCredentialsProvider,
         });
-
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore
-      await send({}, null);
-
-      const middlewareArgs: any = {
-        request: {
-          headers: {},
-        },
+        await credentialsStsClient
+          .assumeRoleWithWebIdentity({
+            RoleArn: 'arn:aws:iam::123456789012:role/test-role',
+            RoleSessionName: 'test-session',
+            WebIdentityToken: 'mock-token',
+          })
+          .catch((err: any) => {});
+        return { accessKeyId: 'sts-access-key', secretAccessKey: 'secret' };
       };
-      await mockedMiddlewareStackInternal[0][0]((arg: any) => Promise.resolve(), null)(middlewareArgs);
 
-      sinon.restore();
-      expect(middlewareArgs.request.headers['isCarrierModified']).toEqual('carrierIsModified');
-      expect(mockedMiddlewareStackInternal[0][1].name).toEqual('_adotInjectXrayContextMiddleware');
+      // Create main client with recursive credentials provider
+      const mainClient = new STS({
+        region: 'us-east-1',
+        credentials: recursiveCredentialsProvider,
+      });
+
+      // Mock HTTP responses
+      nock('https://sts.us-east-1.amazonaws.com')
+        .post('/')
+        .reply(200, '<GetCallerIdentityResponse></GetCallerIdentityResponse>');
+
+      // Make Lambda call - this triggers credential extraction which calls STS
+      await mainClient.getCallerIdentity({}).catch((err: any) => {});
+
+      const testSpans = getTestSpans();
+      const stsSpans = testSpans.filter(s => s.name.includes('GetCallerIdentity'));
+
+      expect(stsSpans.length).toBe(1);
+      expect(credentialsCallCount).toBe(2); // 1. Main client needs credentials 2. Nested STS client needs credentials
+      expect(skipCredentialCaptureValue).toBe(true); // Should detect skip key in context
+      expect(stsSpans[0].attributes[AWS_ATTRIBUTE_KEYS.AWS_AUTH_ACCOUNT_ACCESS_KEY]).toBe('sts-access-key');
     });
 
     it('injects trace context header into request via propagator', async () => {
@@ -605,26 +968,210 @@ describe('InstrumentationPatchTest', () => {
           .traceId.substring(8, 32)};Parent=${spanId};Sampled=1`
       );
     });
+
+    it('Tests patched AwsLambdaInstrumentation method with error', done => {
+      const awsLambdaInstrumentation = extractAwsLambdaInstrumentation(PATCHED_INSTRUMENTATIONS);
+      // Create a mock Span object since Span is no longer exported as a value in OTel 2.x
+      const mockSpan: Span = {
+        setAttribute: sinon.stub(),
+        setAttributes: sinon.stub(),
+        addEvent: sinon.stub(),
+        addLink: sinon.stub(),
+        addLinks: sinon.stub(),
+        setStatus: sinon.stub(),
+        updateName: sinon.stub(),
+        end: sinon.stub(),
+        isRecording: sinon.stub().returns(true),
+        recordException: sinon.stub(),
+        spanContext: sinon
+          .stub()
+          .returns({ traceId: '00000000000000000000000000000001', spanId: '0000000000000001', traceFlags: 0 }),
+      } as unknown as Span;
+      awsLambdaInstrumentation['_endInvocationSpanAndFlush'](mockSpan, 'SomeError', () => {
+        expect((mockSpan.recordException as any).getCall(0).args[0]).toEqual('SomeError');
+        expect((mockSpan.setStatus as any).getCall(0).args[0]).toEqual({
+          code: SpanStatusCode.ERROR,
+          message: 'SomeError',
+        });
+        done();
+      });
+    });
+  });
+
+  describe('AwsLambdaInstrumentationPatchTest', () => {
+    let awsLambdaInstrumentation: ExtendedAwsLambdaInstrumentation;
+    beforeEach(() => {
+      const instrumentationsToTest = [
+        new AwsLambdaInstrumentation(instrumentationConfigs['@opentelemetry/instrumentation-aws-lambda']),
+      ];
+      applyInstrumentationPatches(instrumentationsToTest);
+      awsLambdaInstrumentation = instrumentationsToTest[0] as ExtendedAwsLambdaInstrumentation;
+    });
+
+    afterEach(() => {
+      sinon.restore();
+    });
+
+    it('Tests setLoggerProvider method', () => {
+      const resolvedPromise = Promise.resolve();
+      const mockLoggerProvider = {
+        getDelegate: () => ({
+          forceFlush: () => resolvedPromise,
+        }),
+        getLogger: () => {
+          return {
+            emit: () => {},
+            enabled: () => true,
+          };
+        },
+      };
+
+      awsLambdaInstrumentation.setLoggerProvider(mockLoggerProvider as LoggerProvider);
+      expect(awsLambdaInstrumentation['_logForceFlusher']!()).toBe(resolvedPromise);
+    });
+
+    it('Tests _logForceFlush with provider that has getDelegate', () => {
+      const mockForceFlush = sinon.stub().resolves();
+      const mockLoggerProvider = {
+        getDelegate: () => ({
+          forceFlush: mockForceFlush,
+        }),
+        getLogger: () => {
+          return {
+            emit: () => {},
+            enabled: () => true,
+          };
+        },
+      };
+
+      const flusher = awsLambdaInstrumentation['_logForceFlush'](mockLoggerProvider as LoggerProvider);
+      expect(flusher).toBeDefined();
+      flusher?.();
+      expect(mockForceFlush.called).toBeTruthy();
+    });
+
+    it('Tests _logForceFlush with provider that has direct forceFlush', () => {
+      const mockForceFlush = sinon.stub().resolves();
+      const mockLoggerProvider = {
+        forceFlush: mockForceFlush,
+        getLogger: () => {
+          return {
+            emit: () => {},
+            enabled: () => true,
+          };
+        },
+      };
+
+      const flusher = awsLambdaInstrumentation['_logForceFlush'](mockLoggerProvider as LoggerProvider);
+      expect(flusher).toBeDefined();
+      flusher?.();
+      expect(mockForceFlush.called).toBeTruthy();
+    });
+
+    it('Tests _logForceFlush with undefined provider', () => {
+      const flusher = awsLambdaInstrumentation['_logForceFlush'](undefined as unknown as LoggerProvider);
+      expect(flusher).toBeUndefined();
+    });
+
+    it('Tests _endInvocationSpanAndFlush with all flushers', done => {
+      // Create a mock Span object since Span is no longer exported as a value in OTel 2.x
+      const mockSpan: Span = {
+        setAttribute: sinon.stub(),
+        setAttributes: sinon.stub(),
+        addEvent: sinon.stub(),
+        addLink: sinon.stub(),
+        addLinks: sinon.stub(),
+        setStatus: sinon.stub(),
+        updateName: sinon.stub(),
+        end: sinon.stub(),
+        isRecording: sinon.stub().returns(true),
+        recordException: sinon.stub(),
+        spanContext: sinon
+          .stub()
+          .returns({ traceId: '00000000000000000000000000000001', spanId: '0000000000000001', traceFlags: 0 }),
+      } as unknown as Span;
+
+      // Setup mock flushers
+      const mockTraceFlush = sinon.stub().resolves();
+      const mockMetricFlush = sinon.stub().resolves();
+      const mockLogFlush = sinon.stub().resolves();
+
+      awsLambdaInstrumentation['_traceForceFlusher'] = mockTraceFlush;
+      awsLambdaInstrumentation['_metricForceFlusher'] = mockMetricFlush;
+      awsLambdaInstrumentation['_logForceFlusher'] = mockLogFlush;
+
+      awsLambdaInstrumentation['_endInvocationSpanAndFlush'](mockSpan, null, () => {
+        expect(mockTraceFlush.called).toBeTruthy();
+        expect(mockMetricFlush.called).toBeTruthy();
+        expect(mockLogFlush.called).toBeTruthy();
+        done();
+      });
+    });
+
+    it('Tests _endInvocationSpanAndFlush handles missing flushers gracefully', done => {
+      // Create a mock Span object since Span is no longer exported as a value in OTel 2.x
+      const mockSpan: Span = {
+        setAttribute: sinon.stub(),
+        setAttributes: sinon.stub(),
+        addEvent: sinon.stub(),
+        addLink: sinon.stub(),
+        addLinks: sinon.stub(),
+        setStatus: sinon.stub(),
+        updateName: sinon.stub(),
+        end: sinon.stub(),
+        isRecording: sinon.stub().returns(true),
+        recordException: sinon.stub(),
+        spanContext: sinon
+          .stub()
+          .returns({ traceId: '00000000000000000000000000000001', spanId: '0000000000000001', traceFlags: 0 }),
+      } as unknown as Span;
+      const mockDiag = sinon.spy(diag, 'debug');
+      const mockDiagError = sinon.spy(diag, 'error');
+
+      awsLambdaInstrumentation['_endInvocationSpanAndFlush'](mockSpan, null, () => {
+        expect(
+          mockDiagError.calledWith(
+            'Spans may not be exported for the lambda function because we are not force flushing before callback.'
+          )
+        ).toBeTruthy();
+        expect(
+          mockDiag.calledWith(
+            'Metrics may not be exported for the lambda function because we are not force flushing before callback.'
+          )
+        ).toBeTruthy();
+        expect(
+          mockDiag.calledWith(
+            'Logs may not be exported for the lambda function because we are not force flushing before callback.'
+          )
+        ).toBeTruthy();
+        done();
+      });
+    });
   });
 });
 
 describe('customExtractor', () => {
   const traceContextEnvironmentKey = '_X_AMZN_TRACE_ID';
-  const MOCK_XRAY_TRACE_ID = '8a3c60f7d188f8fa79d48a391a778fa6';
-  const MOCK_XRAY_TRACE_ID_STR = '1-8a3c60f7-d188f8fa79d48a391a778fa6';
-  const MOCK_XRAY_PARENT_SPAN_ID = '53995c3f42cd8ad8';
+  const MOCK_XRAY_TRACE_ID_0 = '8a3c0000d188f8fa79d48a391a770000';
+  const MOCK_XRAY_TRACE_ID_1 = '8a3c0001d188f8fa79d48a391a770001';
+  const MOCK_XRAY_TRACE_ID_STR_0 = '8a3c0000-d188f8fa79d48a391a770000';
+  const MOCK_XRAY_TRACE_ID_STR_1 = '8a3c0001-d188f8fa79d48a391a770001';
+  const MOCK_XRAY_PARENT_SPAN_ID_0 = '53995c3f42cd0000';
+  const MOCK_XRAY_PARENT_SPAN_ID_1 = '53995c3f42cd0001';
   const MOCK_XRAY_LAMBDA_LINEAGE = 'Lineage=01cfa446:0';
 
   const TRACE_ID_VERSION = '1'; // Assuming TRACE_ID_VERSION is defined somewhere in the code
 
   // Common part of the XRAY trace context
-  const MOCK_XRAY_TRACE_CONTEXT_COMMON = `Root=${TRACE_ID_VERSION}-${MOCK_XRAY_TRACE_ID_STR};Parent=${MOCK_XRAY_PARENT_SPAN_ID}`;
+  const MOCK_XRAY_TRACE_CONTEXT_0_COMMON = `Root=${TRACE_ID_VERSION}-${MOCK_XRAY_TRACE_ID_STR_0};Parent=${MOCK_XRAY_PARENT_SPAN_ID_0}`;
+  const MOCK_XRAY_TRACE_CONTEXT_1_COMMON = `Root=${TRACE_ID_VERSION}-${MOCK_XRAY_TRACE_ID_STR_1};Parent=${MOCK_XRAY_PARENT_SPAN_ID_1}`;
 
   // Different versions of the XRAY trace context
-  const MOCK_XRAY_TRACE_CONTEXT_SAMPLED = `${MOCK_XRAY_TRACE_CONTEXT_COMMON};Sampled=1;${MOCK_XRAY_LAMBDA_LINEAGE}`;
+  const MOCK_XRAY_TRACE_CONTEXT_0_SAMPLED = `${MOCK_XRAY_TRACE_CONTEXT_0_COMMON};Sampled=1;${MOCK_XRAY_LAMBDA_LINEAGE}`;
+  const MOCK_XRAY_TRACE_CONTEXT_1_UNSAMPLED = `${MOCK_XRAY_TRACE_CONTEXT_1_COMMON};Sampled=0;${MOCK_XRAY_LAMBDA_LINEAGE}`;
   //   const MOCK_XRAY_TRACE_CONTEXT_PASSTHROUGH = (
-  //     `Root=${TRACE_ID_VERSION}-${MOCK_XRAY_TRACE_ID_STR.slice(0, TRACE_ID_FIRST_PART_LENGTH)}` +
-  //     `-${MOCK_XRAY_TRACE_ID_STR.slice(TRACE_ID_FIRST_PART_LENGTH)};${MOCK_XRAY_LAMBDA_LINEAGE}`
+  //     `Root=${TRACE_ID_VERSION}-${MOCK_XRAY_TRACE_ID_STR_0.slice(0, TRACE_ID_FIRST_PART_LENGTH)}` +
+  //     `-${MOCK_XRAY_TRACE_ID_STR_0.slice(TRACE_ID_FIRST_PART_LENGTH)};${MOCK_XRAY_LAMBDA_LINEAGE}`
   //   );
 
   // Create the W3C Trace Context (Sampled)
@@ -635,9 +1182,12 @@ describe('customExtractor', () => {
   const MOCK_W3C_TRACE_STATE_VALUE = 'test_value';
   const MOCK_TRACE_STATE = `${MOCK_W3C_TRACE_STATE_KEY}=${MOCK_W3C_TRACE_STATE_VALUE},foo=1,bar=2`;
 
-  let awsPropagatorStub: SinonStub;
-  let traceGetSpanStub: SinonStub;
-  // let propagationStub: SinonStub;
+  before(() => {
+    process.env.OTEL_PROPAGATORS = 'baggage,xray,tracecontext';
+    propagation.disable();
+    propagation.setGlobalPropagator(getPropagator());
+    delete process.env.OTEL_PROPAGATORS;
+  });
 
   beforeEach(() => {
     // Clear environment variables before each test
@@ -649,41 +1199,110 @@ describe('customExtractor', () => {
     sinon.restore();
   });
 
-  it('should extract context from lambda trace header when present', () => {
-    const mockLambdaTraceHeader = MOCK_XRAY_TRACE_CONTEXT_SAMPLED;
-    process.env[traceContextEnvironmentKey] = mockLambdaTraceHeader;
+  it('should extract context from handler context xRayTraceId property when present', () => {
+    const mockLambdaTraceHeader = MOCK_XRAY_TRACE_CONTEXT_0_SAMPLED;
+    const mockHandlerContext = {
+      xRayTraceId: mockLambdaTraceHeader,
+    } as unknown as Context;
 
-    const mockParentContext = {} as OtelContext;
-
-    // Partial mock of the Span object
-    const mockSpan: Partial<Span> = {
-      spanContext: sinon.stub().returns({
-        traceId: MOCK_XRAY_TRACE_ID,
-        spanId: MOCK_XRAY_PARENT_SPAN_ID,
-      }),
+    // Mock of the Span Context for validation
+    const mockParentSpanContext: api.SpanContext = {
+      isRemote: true,
+      traceFlags: 1,
+      traceId: MOCK_XRAY_TRACE_ID_0,
+      spanId: MOCK_XRAY_PARENT_SPAN_ID_0,
     };
 
-    // Stub awsPropagator.extract to return the mockParentContext
-    awsPropagatorStub = sinon.stub(AWSXRayPropagator.prototype, 'extract').returns(mockParentContext);
-
-    // Stub trace.getSpan to return the mock span
-    traceGetSpanStub = sinon.stub(trace, 'getSpan').returns(mockSpan as Span);
+    sinon.stub(otelContext, 'active').returns(ROOT_CONTEXT);
 
     // Call the customExtractor function
-    const event = { headers: {} };
+    const event = { headers: {} as Record<string, string> };
+    const result = customExtractor(event, mockHandlerContext);
+
+    // Assertions - verify the actual behavior (context extraction works correctly)
+    // Note: In OTel 2.x, the composite propagator may call individual propagators differently,
+    // so we focus on verifying the extracted context rather than spying on internal methods
+    expect(trace.getSpan(result)?.spanContext()).toEqual(mockParentSpanContext);
+    // Verify the X-Ray header was injected into the event headers
+    expect(event.headers[AWSXRAY_TRACE_ID_HEADER]).toBe(mockLambdaTraceHeader);
+  });
+
+  it('should prioritize extract context from handler context xRayTraceId property instead of environment variable', () => {
+    const mockLambdaContextTraceHeader = MOCK_XRAY_TRACE_CONTEXT_1_UNSAMPLED;
+    const mockLambdEnvVarTraceHeader = MOCK_XRAY_TRACE_CONTEXT_0_SAMPLED;
+
+    process.env[traceContextEnvironmentKey] = mockLambdEnvVarTraceHeader;
+
+    const mockHandlerContext = {
+      xRayTraceId: mockLambdaContextTraceHeader,
+    } as unknown as Context;
+
+    // Mock of the Span Context for validation - should use handler context (trace 1), not env var (trace 0)
+    const mockParentSpanContext: api.SpanContext = {
+      isRemote: true,
+      traceFlags: 0,
+      traceId: MOCK_XRAY_TRACE_ID_1,
+      spanId: MOCK_XRAY_PARENT_SPAN_ID_1,
+    };
+
+    sinon.stub(otelContext, 'active').returns(ROOT_CONTEXT);
+
+    // Call the customExtractor function
+    const event = { headers: {} as Record<string, string> };
+    const result = customExtractor(event, mockHandlerContext);
+
+    // Assertions - verify the actual behavior (handler context is prioritized over env var)
+    expect(trace.getSpan(result)?.spanContext()).toEqual(mockParentSpanContext);
+    // Verify the handler context header (not env var) was injected
+    expect(event.headers[AWSXRAY_TRACE_ID_HEADER]).toBe(mockLambdaContextTraceHeader);
+  });
+
+  it('should fallback to environment variable when handler context xRayTraceId is not available', () => {
+    const mockLambdaTraceHeader = MOCK_XRAY_TRACE_CONTEXT_0_SAMPLED;
+    process.env[traceContextEnvironmentKey] = mockLambdaTraceHeader;
+
+    // Mock of the Span Context for validation
+    const mockParentSpanContext: api.SpanContext = {
+      isRemote: true,
+      traceFlags: 1,
+      traceId: MOCK_XRAY_TRACE_ID_0,
+      spanId: MOCK_XRAY_PARENT_SPAN_ID_0,
+    };
+
+    sinon.stub(otelContext, 'active').returns(ROOT_CONTEXT);
+
+    // Call the customExtractor function with handler context without xRayTraceId
+    const event = { headers: {} as Record<string, string> };
     const result = customExtractor(event, {} as Context);
 
-    // Assertions
-    expect(awsPropagatorStub.calledOnce).toBe(true);
-    expect(
-      awsPropagatorStub.calledWith(
-        sinon.match.any,
-        { [AWSXRAY_TRACE_ID_HEADER]: mockLambdaTraceHeader },
-        sinon.match.any
-      )
-    ).toBe(true);
-    expect(traceGetSpanStub.calledOnce).toBe(true);
-    expect(result).toEqual(mockParentContext); // Should return the parent context when valid
+    // Assertions - verify the actual behavior (fallback to env var works)
+    expect(trace.getSpan(result)?.spanContext()).toEqual(mockParentSpanContext);
+    // Verify the env var header was injected
+    expect(event.headers[AWSXRAY_TRACE_ID_HEADER]).toBe(mockLambdaTraceHeader);
+  });
+
+  it('should handle undefined handler context and fallback to environment variable', () => {
+    const mockLambdaTraceHeader = MOCK_XRAY_TRACE_CONTEXT_0_SAMPLED;
+    process.env[traceContextEnvironmentKey] = mockLambdaTraceHeader;
+
+    // Mock of the Span Context for validation
+    const mockParentSpanContext: api.SpanContext = {
+      isRemote: true,
+      traceFlags: 1,
+      traceId: MOCK_XRAY_TRACE_ID_0,
+      spanId: MOCK_XRAY_PARENT_SPAN_ID_0,
+    };
+
+    sinon.stub(otelContext, 'active').returns(ROOT_CONTEXT);
+
+    // Call the customExtractor function with undefined handler context
+    const event = { headers: {} as Record<string, string> };
+    const result = customExtractor(event, undefined as any);
+
+    // Verify the context was properly extracted from the environment variable
+    expect(trace.getSpan(result)?.spanContext()).toEqual(mockParentSpanContext);
+    // Verify the env var header was injected
+    expect(event.headers[AWSXRAY_TRACE_ID_HEADER]).toBe(mockLambdaTraceHeader);
   });
 
   it('should extract context from HTTP headers when lambda trace header is not present', () => {
@@ -694,19 +1313,14 @@ describe('customExtractor', () => {
         tracestate: MOCK_TRACE_STATE,
       },
     };
-    const mockExtractedContext = {
-      getValue: function () {
-        return undefined;
-      }, // Empty function that returns undefined
-    } as unknown as OtelContext;
-
-    const propagationStub = sinon.stub(propagation, 'extract').returns(mockExtractedContext);
 
     // Call the customExtractor function
-    const mockHttpHeaders = event.headers;
-    customExtractor(event, {} as Context);
+    const result = customExtractor(event, {} as Context);
+    const resultSpanContext = trace.getSpan(result)?.spanContext();
 
-    expect(propagationStub.calledWith(sinon.match.any, mockHttpHeaders, sinon.match.any)).toBe(true);
+    expect(resultSpanContext?.spanId).toEqual('00f067aa0ba902b7');
+    expect(resultSpanContext?.traceId).toEqual('4bf92f3577b34da6a3ce929d0e0e4736');
+    expect(resultSpanContext?.traceFlags).toEqual(1);
   });
 
   it('should return all header keys from the carrier', () => {
@@ -722,5 +1336,153 @@ describe('customExtractor', () => {
   it('should return undefined for a key that does not exist', () => {
     const headerValue = headerGetter.get(mockHeaders, 'non-existent-header');
     expect(headerValue).toBeUndefined();
+  });
+});
+
+describe('AWS Lambda Instrumentation Propagation', () => {
+  const memoryExporter = new InMemorySpanExporter();
+  let oldEnv: NodeJS.ProcessEnv;
+  let instrumentation: AwsLambdaInstrumentation;
+
+  const serializeSpanContext = (spanContext: api.SpanContext, propagator: api.TextMapPropagator): string => {
+    let serialized = '';
+    propagator.inject(
+      trace.setSpan(context.active(), trace.wrapSpanContext(spanContext)),
+      {},
+      {
+        set(carrier: any, key: string, value: string) {
+          serialized = value;
+        },
+      }
+    );
+    return serialized;
+  };
+
+  const sampledAwsSpanContext: api.SpanContext = {
+    traceId: '11111111111111110000000000000000',
+    spanId: '9999999900000000',
+    traceFlags: 1,
+    isRemote: true,
+  };
+  const sampledAwsHeader = serializeSpanContext(sampledAwsSpanContext, new AWSXRayPropagator());
+
+  const sampledAwsSpanContext2: api.SpanContext = {
+    traceId: '11111111111111110000000000000022',
+    spanId: '9999999900000022',
+    traceFlags: 1,
+    isRemote: true,
+  };
+  const sampledAwsHeader2 = serializeSpanContext(sampledAwsSpanContext2, new AWSXRayPropagator());
+
+  const sampledGenericSpanContext: api.SpanContext = {
+    traceId: '00000000000000001111111111111111',
+    spanId: '0000000099999999',
+    traceFlags: 1,
+    isRemote: true,
+  };
+  const sampledGenericSpan = serializeSpanContext(sampledGenericSpanContext, new W3CTraceContextPropagator());
+
+  const lambdaCtx = {
+    functionName: 'my_function',
+    invokedFunctionArn: 'my_arn',
+    awsRequestId: 'aws_request_id',
+    xRayTraceId: sampledAwsHeader,
+  } as unknown as Context;
+
+  const initializeHandler = (propagators: string) => {
+    process.env.LAMBDA_TASK_ROOT = path.resolve(__dirname, '.');
+    process.env._HANDLER = 'lambda-test-handlers/async.handler';
+
+    propagation.disable();
+    process.env.OTEL_PROPAGATORS = propagators;
+    propagation.setGlobalPropagator(getPropagator());
+    delete process.env.OTEL_PROPAGATORS;
+
+    const provider = new NodeTracerProvider({
+      spanProcessors: [new BatchSpanProcessor(memoryExporter)],
+    });
+
+    instrumentation = new AwsLambdaInstrumentation({
+      eventContextExtractor: customExtractor,
+    });
+    applyInstrumentationPatches([instrumentation]);
+    instrumentation.setTracerProvider(provider);
+  };
+
+  const lambdaRequire = (module: string) => require(path.resolve(__dirname, '.', module));
+
+  beforeEach(() => {
+    oldEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    process.env = oldEnv;
+    instrumentation.disable();
+    memoryExporter.reset();
+  });
+
+  it('Prioritizes W3C Header over X-Ray Trace ID from Lambda Context', async () => {
+    initializeHandler('baggage,xray,tracecontext');
+
+    const lambdaEvent = {
+      headers: {
+        traceparent: sampledGenericSpan,
+      },
+    };
+
+    const result = await lambdaRequire('lambda-test-handlers/async').handler(lambdaEvent, lambdaCtx);
+
+    expect(result).toBe('hello world');
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const [span] = spans;
+    expect(span.spanContext().traceId).toBe(sampledGenericSpanContext.traceId);
+    expect(span.parentSpanContext?.spanId).toBe(sampledGenericSpanContext.spanId);
+  });
+
+  it('Prioritizes X-Ray Trace ID from Lambda Context over W3C Header', async () => {
+    initializeHandler('baggage,tracecontext,xray');
+
+    const lambdaEvent = {
+      headers: {
+        traceparent: sampledGenericSpan,
+      },
+    };
+
+    const result = await lambdaRequire('lambda-test-handlers/async').handler(lambdaEvent, lambdaCtx);
+
+    expect(result).toBe('hello world');
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const [span] = spans;
+    expect(span.spanContext().traceId).toBe(sampledAwsSpanContext.traceId);
+    expect(span.parentSpanContext?.spanId).toBe(sampledAwsSpanContext.spanId);
+  });
+
+  it('Prioritizes X-Ray Trace ID from Lambda Context over X-Ray Trace ID from Lambda Event headers', async () => {
+    initializeHandler('xray');
+
+    const lambdaEvent = {
+      headers: {
+        'x-amzn-trace-ID': sampledAwsHeader,
+        'x-amzn-trace-id': sampledAwsHeader,
+        'X-Amzn-Trace-Id': sampledAwsHeader,
+      },
+    };
+    const lambdaCtx2 = {
+      functionName: 'my_function',
+      invokedFunctionArn: 'my_arn',
+      awsRequestId: 'aws_request_id',
+      xRayTraceId: sampledAwsHeader2,
+    } as unknown as Context;
+
+    const result = await lambdaRequire('lambda-test-handlers/async').handler(lambdaEvent, lambdaCtx2);
+
+    expect(result).toBe('hello world');
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const [span] = spans;
+    expect(span.spanContext().traceId).toBe(sampledAwsSpanContext2.traceId);
+    expect(span.parentSpanContext?.spanId).toBe(sampledAwsSpanContext2.spanId);
   });
 });

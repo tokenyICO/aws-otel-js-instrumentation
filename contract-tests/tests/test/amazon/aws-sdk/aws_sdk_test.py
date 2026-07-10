@@ -19,7 +19,10 @@ from amazon.utils.application_signals_constants import (
     AWS_REMOTE_RESOURCE_TYPE,
     AWS_REMOTE_SERVICE,
     AWS_SPAN_KIND,
-    AWS_CLOUDFORMATION_PRIMARY_IDENTIFIER
+    AWS_CLOUDFORMATION_PRIMARY_IDENTIFIER,
+    AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY,
+    AWS_REMOTE_RESOURCE_ACCOUNT_ID,
+    AWS_REMOTE_RESOURCE_REGION
 )
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 from opentelemetry.proto.metrics.v1.metrics_pb2 import ExponentialHistogramDataPoint, Metric
@@ -31,6 +34,7 @@ _logger.setLevel(INFO)
 
 _AWS_SQS_QUEUE_URL: str = "aws.sqs.queue.url"
 _AWS_SQS_QUEUE_NAME: str = "aws.sqs.queue.name"
+_AWS_KINESIS_STREAM_ARN: str = "aws.kinesis.stream.arn"
 _AWS_KINESIS_STREAM_NAME: str = "aws.kinesis.stream.name"
 _AWS_BEDROCK_AGENT_ID: str = "aws.bedrock.agent.id"
 _AWS_BEDROCK_GUARDRAIL_ID: str = "aws.bedrock.guardrail.id"
@@ -40,8 +44,8 @@ _AWS_BEDROCK_DATA_SOURCE_ID: str = "aws.bedrock.data_source.id"
 _AWS_SECRET_ARN: str = "aws.secretsmanager.secret.arn"
 _AWS_SNS_TOPIC_ARN: str = 'aws.sns.topic.arn'
 _AWS_LAMBDA_RESOURCE_MAPPING_ID: str = 'aws.lambda.resource_mapping.id'
-_AWS_STATE_MACHINE_ARN: str = "aws.stepfunctions.state_machine.arn"
-_AWS_ACTIVITY_ARN: str = "aws.stepfunctions.activity.arn"
+_AWS_STATE_MACHINE_ARN: str = "aws.step_functions.state_machine.arn"
+_AWS_ACTIVITY_ARN: str = "aws.step_functions.activity.arn"
 _GEN_AI_REQUEST_MODEL: str = "gen_ai.request.model"
 _GEN_AI_REQUEST_TEMPERATURE: str = "gen_ai.request.temperature"
 _GEN_AI_REQUEST_TOP_P: str = "gen_ai.request.top_p"
@@ -49,6 +53,8 @@ _GEN_AI_REQUEST_MAX_TOKENS: str = "gen_ai.request.max_tokens"
 _GEN_AI_RESPONSE_FINISH_REASONS: str = "gen_ai.response.finish_reasons"
 _GEN_AI_USAGE_INPUT_TOKENS: str = 'gen_ai.usage.input_tokens'
 _GEN_AI_USAGE_OUTPUT_TOKENS: str = 'gen_ai.usage.output_tokens'
+_GEN_AI_REQUEST_STOP_SEQUENCES: str = 'gen_ai.request.stop_sequences'
+_AWS_DYNAMODB_TABLE_ARN: str = "aws.dynamodb.table.arn"
 
 # pylint: disable=too-many-public-methods
 class AWSSDKTest(ContractTestBase):
@@ -236,6 +242,30 @@ class AWSSDKTest(ContractTestBase):
             span_name="DynamoDB.PutItem",
         )
 
+    def test_dynamodb_describe_table(self):
+        self.do_test_requests(
+            "ddb/describe/some-table",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /ddb",
+            remote_service="AWS::DynamoDB",
+            remote_operation="DescribeTable",
+            remote_resource_type="AWS::DynamoDB::Table",
+            remote_resource_identifier="put_test_table",
+            cloudformation_primary_identifier="put_test_table",
+            remote_resource_account_id="000000000000",
+            remote_resource_region="us-west-2",
+            request_specific_attributes={
+                SpanAttributes.AWS_DYNAMODB_TABLE_NAMES: ["put_test_table"],
+            },
+            response_specific_attributes={
+                _AWS_DYNAMODB_TABLE_ARN: r"arn:aws:dynamodb:us-west-2:000000000000:table/put_test_table",
+            },
+            span_name="DynamoDB.DescribeTable",
+        )
+
     def test_dynamodb_error(self):
         self.do_test_requests(
             "ddb/error",
@@ -396,6 +426,28 @@ class AWSSDKTest(ContractTestBase):
                 _AWS_KINESIS_STREAM_NAME: "test_stream",
             },
             span_name="Kinesis.PutRecord",
+        )
+    
+    def test_kinesis_describe_stream(self):
+        self.do_test_requests(
+            "kinesis/describe/my-stream",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /kinesis",
+            remote_service="AWS::Kinesis",
+            remote_operation="DescribeStream",
+            remote_resource_type="AWS::Kinesis::Stream",
+            remote_resource_identifier="test_stream",
+            cloudformation_primary_identifier="test_stream",
+            remote_resource_account_id="000000000000",
+            remote_resource_region="us-west-2",
+            request_specific_attributes={
+                _AWS_KINESIS_STREAM_NAME: "test_stream",
+                _AWS_KINESIS_STREAM_ARN: "arn:aws:kinesis:us-west-2:000000000000:stream/test_stream"
+            },
+            span_name="Kinesis.DescribeStream",
         )
 
     def test_kinesis_error(self):
@@ -636,7 +688,7 @@ class AWSSDKTest(ContractTestBase):
                 },
             span_name="BedrockRuntime.InvokeModel"
         )
-    
+
     def test_bedrock_runtime_invoke_model_mistral_mistral(self):
         self.do_test_requests(
             "bedrock/invokemodel/invoke-model/mistral.mistral-7b-instruct-v0:2",
@@ -663,6 +715,64 @@ class AWSSDKTest(ContractTestBase):
                 _GEN_AI_USAGE_OUTPUT_TOKENS: math.ceil(len("test-output-text") / 6)
                 },
             span_name="BedrockRuntime.InvokeModel"
+        )
+
+    def test_bedrock_runtime_converse(self):
+        self.do_test_requests(
+            "bedrock/converse/converse",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock",
+            rpc_service="BedrockRuntime",
+            remote_service="AWS::BedrockRuntime",
+            remote_operation="Converse",
+            remote_resource_type="AWS::Bedrock::Model",
+            remote_resource_identifier='anthropic.claude-v2:1',
+            cloudformation_primary_identifier="anthropic.claude-v2:1",
+            request_specific_attributes={
+                _GEN_AI_REQUEST_MODEL: 'anthropic.claude-v2:1',
+                _GEN_AI_REQUEST_MAX_TOKENS: 512,
+                _GEN_AI_REQUEST_TEMPERATURE: 0.7,
+                _GEN_AI_REQUEST_TOP_P: 0.9,
+                _GEN_AI_REQUEST_STOP_SEQUENCES: ['Human:'],
+                },
+            response_specific_attributes={
+                _GEN_AI_RESPONSE_FINISH_REASONS: ['end_turn'],
+                _GEN_AI_USAGE_INPUT_TOKENS: 12,
+                _GEN_AI_USAGE_OUTPUT_TOKENS: 8,
+                },
+            span_name="chat anthropic.claude-v2:1",
+        )
+
+    def test_bedrock_runtime_converse_stream(self):
+        self.do_test_requests(
+            "bedrock/conversestream/converse-stream",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock",
+            rpc_service="BedrockRuntime",
+            remote_service="AWS::BedrockRuntime",
+            remote_operation="ConverseStream",
+            remote_resource_type="AWS::Bedrock::Model",
+            remote_resource_identifier='anthropic.claude-v2:1',
+            cloudformation_primary_identifier="anthropic.claude-v2:1",
+            request_specific_attributes={
+                _GEN_AI_REQUEST_MODEL: 'anthropic.claude-v2:1',
+                _GEN_AI_REQUEST_MAX_TOKENS: 256,
+                _GEN_AI_REQUEST_TEMPERATURE: 0.8,
+                _GEN_AI_REQUEST_TOP_P: 0.95,
+                _GEN_AI_REQUEST_STOP_SEQUENCES: ['Assistant:'],
+                },
+            response_specific_attributes={
+                _GEN_AI_RESPONSE_FINISH_REASONS: ['end_turn'],
+                _GEN_AI_USAGE_INPUT_TOKENS: 15,
+                _GEN_AI_USAGE_OUTPUT_TOKENS: 10,
+                },
+            span_name="chat anthropic.claude-v2:1",
         )
     
     def test_bedrock_get_guardrail(self):
@@ -784,6 +894,126 @@ class AWSSDKTest(ContractTestBase):
                 _AWS_BEDROCK_DATA_SOURCE_ID: "DATASURCID",
             },
             span_name="BedrockAgent.GetDataSource",
+        )
+
+    def test_bedrock_agentcore_invoke_agent_runtime(self):
+        self.do_test_requests(
+            "bedrock-agentcore/invoke-agent-runtime",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="InvokeAgentRuntime",
+            remote_resource_type="AWS::BedrockAgentCore::Runtime",
+            remote_resource_identifier="test-runtime-abc123",
+            cloudformation_primary_identifier="test-runtime-abc123",
+            request_specific_attributes={
+                "aws.bedrock.agentcore.runtime.arn": "arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/test-runtime-abc123",
+            },
+            span_name="BedrockAgentCore.InvokeAgentRuntime",
+        )
+
+    def test_bedrock_agentcore_start_code_interpreter(self):
+        self.do_test_requests(
+            "bedrock-agentcore/start-code-interpreter",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="StartCodeInterpreterSession",
+            remote_resource_type="AWS::BedrockAgentCore::CodeInterpreterCustom",
+            remote_resource_identifier="test-ci-id",
+            cloudformation_primary_identifier="test-ci-id",
+            request_specific_attributes={
+                "gen_ai.code_interpreter.id": "test-ci-id",
+            },
+            span_name="BedrockAgentCore.StartCodeInterpreterSession",
+        )
+
+    def test_bedrock_agentcore_start_browser_session(self):
+        self.do_test_requests(
+            "bedrock-agentcore/start-browser-session",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="StartBrowserSession",
+            remote_resource_type="AWS::BedrockAgentCore::BrowserCustom",
+            remote_resource_identifier="test-browser-id",
+            cloudformation_primary_identifier="test-browser-id",
+            request_specific_attributes={
+                "gen_ai.browser.id": "test-browser-id",
+            },
+            span_name="BedrockAgentCore.StartBrowserSession",
+        )
+
+    def test_bedrock_agentcore_get_resource_api_key(self):
+        self.do_test_requests(
+            "bedrock-agentcore/get-resource-api-key",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="GetResourceApiKey",
+            remote_resource_type="AWS::BedrockAgentCore::APIKeyCredentialProvider",
+            remote_resource_identifier="my-credential-provider",
+            cloudformation_primary_identifier="my-credential-provider",
+            request_specific_attributes={
+                "aws.auth.credential_provider": "my-credential-provider",
+            },
+            span_name="BedrockAgentCore.GetResourceApiKey",
+        )
+
+    def test_bedrock_agentcore_get_memory_record(self):
+        self.do_test_requests(
+            "bedrock-agentcore/get-memory-record",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="GetMemoryRecord",
+            remote_resource_type="AWS::BedrockAgentCore::Memory",
+            remote_resource_identifier="test-memory-id-abc123",
+            cloudformation_primary_identifier="test-memory-id-abc123",
+            request_specific_attributes={
+                "gen_ai.memory.id": "test-memory-id-abc123",
+            },
+            span_name="BedrockAgentCore.GetMemoryRecord",
+        )
+
+    def test_bedrock_agentcore_get_ab_test(self):
+        self.do_test_requests(
+            "bedrock-agentcore/get-ab-test",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /bedrock-agentcore",
+            rpc_service="BedrockAgentCore",
+            remote_service="AWS::BedrockAgentCore",
+            remote_operation="GetABTest",
+            remote_resource_type="AWS::BedrockAgentCore::Gateway",
+            remote_resource_identifier="test-gateway-abc123",
+            cloudformation_primary_identifier="test-gateway-abc123",
+            request_specific_attributes={
+                "aws.bedrock.agentcore.gateway.arn": "arn:aws:bedrock-agentcore:us-west-2:000000000000:gateway/test-gateway-abc123",
+            },
+            span_name="BedrockAgentCore.GetABTest",
         )
 
     def test_secretsmanager_fault(self):
@@ -1034,6 +1264,27 @@ class AWSSDKTest(ContractTestBase):
             span_name="Lambda.GetEventSourceMapping",
         )
 
+    def test_cross_account(self):
+        self.do_test_requests(
+            "cross-account/createbucket/account_b",
+            "GET",
+            200,
+            0,
+            0,
+            local_operation="GET /cross-account",
+            remote_service="AWS::S3",
+            remote_operation="CreateBucket",
+            remote_resource_type="AWS::S3::Bucket",
+            remote_resource_identifier="cross-account-bucket",
+            cloudformation_primary_identifier="cross-account-bucket",
+            request_specific_attributes={
+                SpanAttributes.AWS_S3_BUCKET: "cross-account-bucket",
+            },
+            remote_resource_account_access_key="account_b_access_key_id",
+            remote_resource_region="eu-central-1",
+            span_name="S3.CreateBucket",
+        )
+
     #TODO: Need to add test_lambda_get_event_source_mapping once workaround is figured out for storing UUID between tests
 
     @override
@@ -1062,6 +1313,9 @@ class AWSSDKTest(ContractTestBase):
             kwargs.get("remote_resource_type", "None"),
             kwargs.get("remote_resource_identifier", "None"),
             kwargs.get("cloudformation_primary_identifier", "None"),
+            kwargs.get("remote_resource_account_id", "None"),
+            kwargs.get("remote_resource_region", "None"),
+            kwargs.get("remote_resource_account_access_key", "None"),
         )
 
     def _assert_aws_attributes(
@@ -1073,7 +1327,10 @@ class AWSSDKTest(ContractTestBase):
         span_kind: str,
         remote_resource_type: str,
         remote_resource_identifier: str,
-        cloudformation_primary_identifier: str
+        cloudformation_primary_identifier: str,
+        remote_resource_account_id: str,
+        remote_resource_region: str,
+        remote_resource_account_access_key: str
     ) -> None:
         attributes_dict: Dict[str, AnyValue] = self._get_attributes_dict(attributes_list)
         self._assert_str_attribute(attributes_dict, AWS_LOCAL_SERVICE, self.get_application_otel_service_name())
@@ -1086,7 +1343,16 @@ class AWSSDKTest(ContractTestBase):
             self._assert_attribute(attributes_dict, AWS_REMOTE_RESOURCE_IDENTIFIER, remote_resource_identifier)
         if cloudformation_primary_identifier != "None":
             self._assert_attribute(attributes_dict, AWS_CLOUDFORMATION_PRIMARY_IDENTIFIER, cloudformation_primary_identifier)
-
+        if remote_resource_account_id != "None":
+            assert remote_resource_identifier != "None"        
+            self._assert_str_attribute(attributes_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ID, remote_resource_account_id)
+            self.assertIsNone(attributes_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY))
+        if remote_resource_account_access_key != "None":
+            assert remote_resource_identifier != "None"        
+            self._assert_str_attribute(attributes_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY, remote_resource_account_access_key)
+            self.assertIsNone(attributes_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ID))
+        if remote_resource_region != "None":
+            self._assert_str_attribute(attributes_dict, AWS_REMOTE_RESOURCE_REGION, remote_resource_region)
         self._assert_str_attribute(attributes_dict, AWS_SPAN_KIND, span_kind)
 
     @override
@@ -1187,10 +1453,23 @@ class AWSSDKTest(ContractTestBase):
             self._assert_attribute(attribute_dict, AWS_SPAN_KIND, kwargs.get("dependency_metric_span_kind") or "CLIENT")
             remote_resource_type = kwargs.get("remote_resource_type", "None")
             remote_resource_identifier = kwargs.get("remote_resource_identifier", "None")
+            remote_resource_account_id = kwargs.get("remote_resource_account_id", "None")
+            remote_resource_account_access_key = kwargs.get("remote_resource_account_access_key", "None")
+            remote_resource_region = kwargs.get("remote_resource_region", "None")
             if remote_resource_type != "None":
                 self._assert_attribute(attribute_dict, AWS_REMOTE_RESOURCE_TYPE, remote_resource_type)
             if remote_resource_identifier != "None":
                 self._assert_attribute(attribute_dict, AWS_REMOTE_RESOURCE_IDENTIFIER, remote_resource_identifier)
+            if remote_resource_account_id != "None":
+                assert remote_resource_identifier != "None"        
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ID, remote_resource_account_id)
+                self.assertIsNone(attribute_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY))
+            if remote_resource_account_access_key != "None":
+                assert remote_resource_identifier != "None"        
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY, remote_resource_account_access_key)
+                self.assertIsNone(attribute_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ID))
+            if remote_resource_region != "None":
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_REGION, remote_resource_region)
             self.check_sum(metric_name, dependency_dp.sum, expected_sum)
 
             attribute_dict: Dict[str, AnyValue] = self._get_attributes_dict(service_dp.attributes)
@@ -1212,10 +1491,23 @@ class AWSSDKTest(ContractTestBase):
             self._assert_str_attribute(attribute_dict, AWS_SPAN_KIND, kwargs.get("dependency_metric_span_kind") or "CLIENT")
             remote_resource_type = kwargs.get("remote_resource_type", "None")
             remote_resource_identifier = kwargs.get("remote_resource_identifier", "None")
+            remote_resource_account_id = kwargs.get("remote_resource_account_id", "None")
+            remote_resource_account_access_key = kwargs.get("remote_resource_account_access_key", "None")
+            remote_resource_region = kwargs.get("remote_resource_region", "None")
             if remote_resource_type != "None":
                 self._assert_attribute(attribute_dict, AWS_REMOTE_RESOURCE_TYPE, remote_resource_type)
             if remote_resource_identifier != "None":
                 self._assert_attribute(attribute_dict, AWS_REMOTE_RESOURCE_IDENTIFIER, remote_resource_identifier)
+            if remote_resource_account_id != "None":
+                assert remote_resource_identifier != "None"        
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ID, remote_resource_account_id)
+                self.assertIsNone(attribute_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY))
+            if remote_resource_account_access_key != "None":
+                assert remote_resource_identifier != "None"        
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY, remote_resource_account_access_key)
+                self.assertIsNone(attribute_dict.get(AWS_REMOTE_RESOURCE_ACCOUNT_ID))
+            if remote_resource_region != "None":
+                self._assert_str_attribute(attribute_dict, AWS_REMOTE_RESOURCE_REGION, remote_resource_region)
             self.check_sum(metric_name, dependency_dp.sum, expected_sum)
 
             attribute_dict_service: Dict[str, AnyValue] = self._get_attributes_dict(service_dp.attributes)

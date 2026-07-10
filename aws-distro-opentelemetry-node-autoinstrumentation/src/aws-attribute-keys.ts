@@ -4,13 +4,18 @@
 import { SEMATTRS_AWS_DYNAMODB_TABLE_NAMES } from '@opentelemetry/semantic-conventions';
 
 // Utility class holding attribute keys with special meaning to AWS components
-export const AWS_ATTRIBUTE_KEYS: { [key: string]: string } = {
+export const AWS_ATTRIBUTE_KEYS = {
+  AWS_AUTH_ACCOUNT_ACCESS_KEY: 'aws.auth.account.access_key',
+  AWS_AUTH_REGION: 'aws.auth.region',
   AWS_SPAN_KIND: 'aws.span.kind',
   AWS_LOCAL_SERVICE: 'aws.local.service',
   AWS_LOCAL_OPERATION: 'aws.local.operation',
   AWS_REMOTE_SERVICE: 'aws.remote.service',
   AWS_REMOTE_ENVIRONMENT: 'aws.remote.environment',
   AWS_REMOTE_OPERATION: 'aws.remote.operation',
+  AWS_REMOTE_RESOURCE_ACCOUNT_ACCESS_KEY: 'aws.remote.resource.account.access_key',
+  AWS_REMOTE_RESOURCE_ACCOUNT_ID: 'aws.remote.resource.account.id',
+  AWS_REMOTE_RESOURCE_REGION: 'aws.remote.resource.region',
   AWS_REMOTE_RESOURCE_TYPE: 'aws.remote.resource.type',
   AWS_REMOTE_RESOURCE_IDENTIFIER: 'aws.remote.resource.identifier',
   AWS_SDK_DESCENDANT: 'aws.sdk.descendant',
@@ -31,7 +36,9 @@ export const AWS_ATTRIBUTE_KEYS: { [key: string]: string } = {
   AWS_S3_BUCKET: 'aws.s3.bucket',
   AWS_SQS_QUEUE_URL: 'aws.sqs.queue.url',
   AWS_SQS_QUEUE_NAME: 'aws.sqs.queue.name',
+  AWS_KINESIS_STREAM_ARN: 'aws.kinesis.stream.arn',
   AWS_KINESIS_STREAM_NAME: 'aws.kinesis.stream.name',
+  AWS_DYNAMODB_TABLE_ARN: 'aws.dynamodb.table.arn',
   AWS_DYNAMODB_TABLE_NAMES: SEMATTRS_AWS_DYNAMODB_TABLE_NAMES,
   AWS_BEDROCK_DATA_SOURCE_ID: 'aws.bedrock.data_source.id',
   AWS_BEDROCK_KNOWLEDGE_BASE_ID: 'aws.bedrock.knowledge_base.id',
@@ -40,9 +47,26 @@ export const AWS_ATTRIBUTE_KEYS: { [key: string]: string } = {
   AWS_BEDROCK_GUARDRAIL_ARN: 'aws.bedrock.guardrail.arn',
   AWS_SNS_TOPIC_ARN: 'aws.sns.topic.arn',
   AWS_SECRETSMANAGER_SECRET_ARN: 'aws.secretsmanager.secret.arn',
-  AWS_STEPFUNCTIONS_STATEMACHINE_ARN: 'aws.stepfunctions.state_machine.arn',
-  AWS_STEPFUNCTIONS_ACTIVITY_ARN: 'aws.stepfunctions.activity.arn',
+  AWS_STEPFUNCTIONS_STATEMACHINE_ARN: 'aws.step_functions.state_machine.arn',
+  AWS_STEPFUNCTIONS_ACTIVITY_ARN: 'aws.step_functions.activity.arn',
   AWS_LAMBDA_FUNCTION_NAME: 'aws.lambda.function.name',
   AWS_LAMBDA_RESOURCE_MAPPING_ID: 'aws.lambda.resource_mapping.id',
   AWS_LAMBDA_FUNCTION_ARN: 'aws.lambda.function.arn',
+  AWS_SERVICE_TYPE: 'aws.service.type',
+  AWS_BEDROCK_AGENTCORE_RUNTIME_ARN: 'aws.bedrock.agentcore.runtime.arn',
+  AWS_BEDROCK_AGENTCORE_RUNTIME_ENDPOINT_ARN: 'aws.bedrock.agentcore.runtime_endpoint.arn',
+  AWS_BEDROCK_AGENTCORE_CODE_INTERPRETER_ARN: 'aws.bedrock.agentcore.code_interpreter.arn',
+  AWS_BEDROCK_AGENTCORE_BROWSER_ARN: 'aws.bedrock.agentcore.browser.arn',
+  AWS_BEDROCK_AGENTCORE_MEMORY_ARN: 'aws.bedrock.agentcore.memory.arn',
+  AWS_BEDROCK_AGENTCORE_GATEWAY_ARN: 'aws.bedrock.agentcore.gateway.arn',
+  AWS_BEDROCK_AGENTCORE_WORKLOAD_IDENTITY_ARN: 'aws.bedrock.agentcore.identity.workload_identity.arn',
+  AWS_AUTH_CREDENTIAL_PROVIDER: 'aws.auth.credential_provider',
+  AWS_GATEWAY_TARGET_ID: 'aws.gateway.target.id',
+
+  // TODO: contribute gen_ai.* attributes to upstream semconv
+  GEN_AI_RUNTIME_ID: 'gen_ai.runtime.id',
+  GEN_AI_BROWSER_ID: 'gen_ai.browser.id',
+  GEN_AI_CODE_INTERPRETER_ID: 'gen_ai.code_interpreter.id',
+  GEN_AI_MEMORY_ID: 'gen_ai.memory.id',
+  GEN_AI_GATEWAY_ID: 'gen_ai.gateway.id',
 };

@@ -20,7 +20,7 @@ runs:
   using: "composite"
   steps:
     - name: Set up node
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 #v5.0.0
       with:
         node-version: ${{ inputs.node_version }}
         registry-url: 'https://registry.npmjs.org'
@@ -34,4 +34,9 @@ runs:
     - name: Run unit tests/benchmarks
       if: ${{ inputs.run_unit_tests == 'true' }}
       shell: bash
-      run: npm run test
+      run: |
+        if [ "${{ inputs.node_version }}" = "18" ]; then
+          npm run test:node18
+        else
+          npm run test
+        fi

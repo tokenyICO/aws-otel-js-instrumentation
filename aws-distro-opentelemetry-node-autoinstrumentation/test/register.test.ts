@@ -2,39 +2,320 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modifications Copyright The OpenTelemetry Authors. Licensed under the Apache License 2.0 License.
 
-import { NodeSDK } from '@opentelemetry/sdk-node';
 import * as assert from 'assert';
 import { spawnSync, SpawnSyncReturns } from 'child_process';
 import expect from 'expect';
-import { setAwsDefaultEnvironmentVariables } from '../src/register';
+import type { resolveServiceEventsBootstrap as ResolveServiceEventsBootstrapFn } from '../src/register';
+// Populated lazily inside describe('resolveServiceEventsBootstrap()') — see before() hook.
+// Do NOT import from '../src/register' statically: register.ts calls sdk.start() on load.
+let resolveServiceEventsBootstrap: typeof ResolveServiceEventsBootstrapFn;
+import * as opentelemetry from '@opentelemetry/sdk-node';
+import * as sinon from 'sinon';
+import { trace } from '@opentelemetry/api';
+import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
+import {
+  LangChainInstrumentation,
+  INSTRUMENTATION_SHORT_NAME as LANGCHAIN_SHORT_NAME,
+  INSTRUMENTATION_NAME as LANGCHAIN_NAME,
+} from '../src/instrumentation/instrumentation-langchain/instrumentation';
+import {
+  OpenAIAgentsInstrumentation,
+  INSTRUMENTATION_SHORT_NAME as OPENAI_AGENTS_SHORT_NAME,
+  INSTRUMENTATION_NAME as OPENAI_AGENTS_NAME,
+} from '../src/instrumentation/instrumentation-openai-agents/instrumentation';
+import {
+  VercelAIInstrumentation,
+  INSTRUMENTATION_SHORT_NAME as VERCEL_AI_SHORT_NAME,
+  INSTRUMENTATION_NAME as VERCEL_AI_NAME,
+} from '../src/instrumentation/instrumentation-vercel-ai/instrumentation';
 
 // The OpenTelemetry Authors code
 // Extend register.test.ts functionality to also test exported span with Application Signals enabled
 describe('Register', function () {
-  it('Requires without error', () => {
-    const originalPrototypeStart = NodeSDK.prototype.start;
-    NodeSDK.prototype.start = () => {};
-    try {
-      require('../src/register');
-    } catch (err: unknown) {
-      assert.fail(`require register unexpectedly failed: ${err}`);
-    }
+  let instrumentations: any[];
+  let setAwsDefaultEnvironmentVariables: () => void;
 
-    NodeSDK.prototype.start = originalPrototypeStart;
+  before(() => {
+    const stub = sinon.stub(opentelemetry.NodeSDK.prototype, 'start');
+    const register = require('../src/register');
+    stub.restore();
+    instrumentations = register.instrumentations;
+    setAwsDefaultEnvironmentVariables = register.setAwsDefaultEnvironmentVariables;
+    for (const instr of instrumentations) {
+      instr.disable();
+    }
   });
 
-  it('Tests AWS Default Environment Variables', () => {
-    this.beforeEach(() => {
+  describe('register instrumentation', () => {
+    const baseEnv = {
+      ...process.env,
+      OTEL_NODE_RESOURCE_DETECTORS: 'none',
+      OTEL_TRACES_EXPORTER: 'none',
+      OTEL_METRICS_EXPORTER: 'none',
+      OTEL_LOGS_EXPORTER: 'none',
+      OTEL_LOG_LEVEL: 'NONE',
+    };
+
+    const spawnWithAssertion = (env: Record<string, string | undefined>, assertion: string) => {
+      const script = `
+        const assert = require('assert');
+        const register = require('../build/src/register.js');
+        const instrumentations = register.instrumentations;
+        const names = instrumentations.map(i => i.instrumentationName);
+        ${assertion}
+        process.exit(0);
+      `;
+      return spawnSync(process.execPath, ['-e', script], {
+        cwd: __dirname,
+        timeout: 10000,
+        killSignal: 'SIGKILL',
+        env: { ...baseEnv, ...env },
+      });
+    };
+
+    const testInstrumentation = (instrumentationClass: any, fullName: string, shortName: string) => {
+      describe(shortName, () => {
+        it('is registered by default', () => {
+          const found = instrumentations.find((i: any) => i instanceof instrumentationClass);
+          assert.ok(found, `${fullName} should be in the instrumentations list`);
+          assert.strictEqual(found.instrumentationName, fullName);
+        });
+
+        it('is disabled via OTEL_NODE_DISABLED_INSTRUMENTATIONS', () => {
+          const proc = spawnWithAssertion(
+            { OTEL_NODE_DISABLED_INSTRUMENTATIONS: shortName },
+            `const instr = instrumentations.find(i => i.instrumentationName === '${fullName}');
+             assert.ok(instr, '${fullName} should be registered');
+             assert.ok(!instr.isEnabled(), '${fullName} should be disabled');`
+          );
+          assert.ifError(proc.error);
+          assert.equal(proc.status, 0, proc.stderr?.toString());
+        });
+
+        it('is disabled when OTEL_NODE_ENABLED_INSTRUMENTATIONS is set without it', () => {
+          const proc = spawnWithAssertion(
+            { OTEL_NODE_ENABLED_INSTRUMENTATIONS: 'http' },
+            `const instr = instrumentations.find(i => i.instrumentationName === '${fullName}');
+             assert.ok(instr, '${fullName} should be registered');
+             assert.ok(!instr.isEnabled(), '${fullName} should be disabled');`
+          );
+          assert.ifError(proc.error);
+          assert.equal(proc.status, 0, proc.stderr?.toString());
+        });
+
+        it('is enabled when OTEL_NODE_ENABLED_INSTRUMENTATIONS includes it', () => {
+          const proc = spawnWithAssertion(
+            { OTEL_NODE_ENABLED_INSTRUMENTATIONS: `http,${shortName}` },
+            `assert.ok(names.includes('${fullName}'));`
+          );
+          assert.ifError(proc.error);
+          assert.equal(proc.status, 0, proc.stderr?.toString());
+        });
+      });
+    };
+
+    testInstrumentation(LangChainInstrumentation, LANGCHAIN_NAME, LANGCHAIN_SHORT_NAME);
+    testInstrumentation(OpenAIAgentsInstrumentation, OPENAI_AGENTS_NAME, OPENAI_AGENTS_SHORT_NAME);
+    testInstrumentation(VercelAIInstrumentation, VERCEL_AI_NAME, VERCEL_AI_SHORT_NAME);
+
+    describe('third-party conflict detection', () => {
+      const conflictTestCases: {
+        name: string;
+        fakePackage: string;
+        instrumentationName: string;
+        expectedDisabled: boolean;
+        optIn?: boolean;
+      }[] = [
+        {
+          name: 'disables LangChain when @traceloop/instrumentation-langchain is installed',
+          fakePackage: '@traceloop/instrumentation-langchain',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables LangChain when @arizeai/openinference-instrumentation-langchain is installed',
+          fakePackage: '@arizeai/openinference-instrumentation-langchain',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables LangChain when @arizeai/openinference-instrumentation-langchain-v0 is installed',
+          fakePackage: '@arizeai/openinference-instrumentation-langchain-v0',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables LangChain when @microsoft/agents-a365-observability-extensions-langchain is installed',
+          fakePackage: '@microsoft/agents-a365-observability-extensions-langchain',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables LangChain when @langfuse/langchain is installed',
+          fakePackage: '@langfuse/langchain',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'enables LangChain with @traceloop/instrumentation-langchain when opt-in',
+          fakePackage: '@traceloop/instrumentation-langchain',
+          instrumentationName: LANGCHAIN_NAME,
+          expectedDisabled: false,
+          optIn: true,
+        },
+        {
+          name: 'disables OpenAI Agents when @respan/instrumentation-openai-agents is installed',
+          fakePackage: '@respan/instrumentation-openai-agents',
+          instrumentationName: OPENAI_AGENTS_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables OpenAI Agents when @microsoft/agents-a365-observability-extensions-openai is installed',
+          fakePackage: '@microsoft/agents-a365-observability-extensions-openai',
+          instrumentationName: OPENAI_AGENTS_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'enables OpenAI Agents with @respan/instrumentation-openai-agents when opt-in',
+          fakePackage: '@respan/instrumentation-openai-agents',
+          instrumentationName: OPENAI_AGENTS_NAME,
+          expectedDisabled: false,
+          optIn: true,
+        },
+        {
+          name: 'does not disable OpenAI Agents when @traceloop/instrumentation-openai is installed',
+          fakePackage: '@traceloop/instrumentation-openai',
+          instrumentationName: OPENAI_AGENTS_NAME,
+          expectedDisabled: false,
+        },
+        {
+          name: 'disables Vercel AI when @monocle.sh/instrumentation-vercel-ai is installed',
+          fakePackage: '@monocle.sh/instrumentation-vercel-ai',
+          instrumentationName: VERCEL_AI_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'disables Vercel AI when @respan/instrumentation-vercel is installed',
+          fakePackage: '@respan/instrumentation-vercel',
+          instrumentationName: VERCEL_AI_NAME,
+          expectedDisabled: true,
+        },
+        {
+          name: 'enables Vercel AI with @monocle.sh/instrumentation-vercel-ai when opt-in',
+          fakePackage: '@monocle.sh/instrumentation-vercel-ai',
+          instrumentationName: VERCEL_AI_NAME,
+          expectedDisabled: false,
+          optIn: true,
+        },
+      ];
+
+      for (const tc of conflictTestCases) {
+        it(tc.name, () => {
+          const script = `
+            const assert = require('assert');
+            const fs = require('fs');
+            const path = require('path');
+            const os = require('os');
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'otel-conflict-'));
+            const pkgDir = path.join(tmpDir, '${tc.fakePackage}');
+            fs.mkdirSync(pkgDir, { recursive: true });
+            fs.writeFileSync(path.join(pkgDir, 'index.js'), '');
+            process.env.NODE_PATH = tmpDir;
+            require('module').Module._initPaths();
+            const register = require('../build/src/register.js');
+            const instr = register.instrumentations.find(
+              i => i.instrumentationName === '${tc.instrumentationName}'
+            );
+            assert.ok(instr, '${tc.instrumentationName} should be registered');
+            assert.strictEqual(
+              instr.isEnabled(), ${!tc.expectedDisabled},
+              '${tc.instrumentationName} should be ${tc.expectedDisabled ? 'disabled' : 'enabled'}'
+            );
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+            process.exit(0);
+          `;
+          const env: Record<string, string | undefined> = {};
+          if (tc.optIn) {
+            env.AWS_AGENTIC_INSTRUMENTATION_OPT_IN = 'true';
+          }
+          const proc = spawnSync(process.execPath, ['-e', script], {
+            cwd: __dirname,
+            timeout: 10000,
+            killSignal: 'SIGKILL',
+            env: { ...baseEnv, ...env },
+          });
+          assert.ifError(proc.error);
+          assert.equal(proc.status, 0, proc.stderr?.toString());
+        });
+      }
+    });
+
+    it('Vercel AI auto-registers VercelAISpanProcessor', () => {
+      const provider = new BasicTracerProvider();
+      trace.setGlobalTracerProvider(provider);
+
+      const instr = new VercelAIInstrumentation();
+      instr.setTracerProvider(trace.getTracerProvider() as any);
+
+      const delegate = (trace.getTracerProvider() as any).getDelegate?.() ?? provider;
+      const processors = delegate._activeSpanProcessor?._spanProcessors ?? [];
+      assert.ok(
+        processors.some((p: any) => p.constructor.name === 'VercelAISpanProcessor'),
+        'VercelAISpanProcessor should be auto-registered'
+      );
+
+      instr.disable();
+      trace.disable();
+    });
+  });
+
+  it('Requires without error', () => {
+    const proc: SpawnSyncReturns<Buffer> = spawnSync(
+      process.execPath,
+      ['--require', '../build/src/register.js', '-e', 'process.exit(0)'],
+      {
+        cwd: __dirname,
+        timeout: 10000,
+        killSignal: 'SIGKILL',
+        env: Object.assign({}, process.env, {
+          OTEL_NODE_RESOURCE_DETECTORS: 'none',
+          OTEL_TRACES_EXPORTER: 'none',
+          OTEL_METRICS_EXPORTER: 'none',
+          OTEL_LOGS_EXPORTER: 'none',
+        }),
+      }
+    );
+    assert.ifError(proc.error);
+    assert.equal(proc.status, 0, `proc.status (${proc.status})`);
+  });
+
+  describe('Tests AWS Default Environment Variables', () => {
+    beforeEach(() => {
       delete process.env.OTEL_EXPORTER_OTLP_PROTOCOL;
       delete process.env.OTEL_PROPAGATORS;
       delete process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS;
+      delete process.env.OTEL_NODE_ENABLED_INSTRUMENTATIONS;
+
+      delete process.env.AWS_REGION;
+      delete process.env.AWS_DEFAULT_REGION;
+      delete process.env.AGENT_OBSERVABILITY_ENABLED;
+      delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+      delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+      delete process.env.OTEL_TRACES_EXPORTER;
+      delete process.env.OTEL_LOGS_EXPORTER;
+      delete process.env.OTEL_METRICS_EXPORTER;
+
+      delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+      delete process.env.OTEL_TRACES_SAMPLER;
+      delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
     });
 
     it('sets AWS Default Environment Variables', () => {
       setAwsDefaultEnvironmentVariables();
       expect(process.env.OTEL_EXPORTER_OTLP_PROTOCOL).toEqual('http/protobuf');
-      expect(process.env.OTEL_PROPAGATORS).toEqual('xray,tracecontext');
-      expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('fs');
+      expect(process.env.OTEL_PROPAGATORS).toEqual('baggage,xray,tracecontext');
+      expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('fs,dns');
     });
 
     it('Does not set AWS Default Environment Variables', () => {
@@ -45,6 +326,247 @@ describe('Register', function () {
       expect(process.env.OTEL_EXPORTER_OTLP_PROTOCOL).toEqual('customProtocol');
       expect(process.env.OTEL_PROPAGATORS).toEqual('customPropagators');
       expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('customDisabledInstrumentations');
+    });
+
+    it('Configures with AgentObservabilityEnabled with unset region', () => {
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).toBeUndefined();
+      expect(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toBeUndefined();
+    });
+
+    it('Configures with AgentObservabilityEnabled with set region', () => {
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+      process.env.AWS_REGION = 'us-west-2';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).toEqual('https://xray.us-west-2.amazonaws.com/v1/traces');
+      expect(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toEqual('https://logs.us-west-2.amazonaws.com/v1/logs');
+
+      delete process.env.AWS_REGION;
+      delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+      process.env.AWS_DEFAULT_REGION = 'us-east-2';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).toEqual('https://xray.us-east-2.amazonaws.com/v1/traces');
+      expect(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toEqual('https://logs.us-east-2.amazonaws.com/v1/logs');
+    });
+
+    it('Does not set signal-specific endpoints when OTEL_EXPORTER_OTLP_ENDPOINT is set', () => {
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+      process.env.AWS_REGION = 'us-west-2';
+      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'http://my-collector:4318';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).toBeUndefined();
+      expect(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toBeUndefined();
+    });
+
+    it('Configures defaults when AgentObservabilityEnabled is true', () => {
+      process.env.AWS_REGION = 'us-east-1';
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_TRACES_EXPORTER).toEqual('otlp');
+      expect(process.env.OTEL_LOGS_EXPORTER).toEqual('otlp');
+      expect(process.env.OTEL_METRICS_EXPORTER).toEqual('awsemf');
+      expect(process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT).toEqual('true');
+      expect(process.env.OTEL_TRACES_SAMPLER).toEqual('parentbased_always_on');
+      expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('fs,dns');
+      expect(process.env.OTEL_NODE_ENABLED_INSTRUMENTATIONS).toEqual(
+        'aws-lambda,aws-sdk,http,undici,aws_langchain,aws_openai_agents,aws_vercel_ai'
+      );
+      expect(process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED).toEqual('false');
+      expect(process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).toEqual('https://xray.us-east-1.amazonaws.com/v1/traces');
+      expect(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toEqual('https://logs.us-east-1.amazonaws.com/v1/logs');
+    });
+
+    it('Respects user configuration when AgentObservabilityEnabled is false', () => {
+      process.env.AWS_REGION = 'us-east-1';
+      delete process.env.AGENT_OBSERVABILITY_ENABLED;
+      process.env.OTEL_TRACES_SAMPLER = 'traceidratio';
+
+      setAwsDefaultEnvironmentVariables();
+      expect(process.env.OTEL_TRACES_SAMPLER).toEqual('traceidratio');
+      expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('fs,dns');
+      expect(process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED).toBeUndefined();
+    });
+
+    it('Respects user configuration when AgentObservabilityEnabled is true', () => {
+      // Enable agent observability
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+      // Set custom values for some environment variables
+      process.env.OTEL_TRACES_SAMPLER = 'traceidratio';
+      process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS = 'a,b,c,d';
+      process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'true';
+
+      setAwsDefaultEnvironmentVariables();
+
+      expect(process.env.OTEL_TRACES_SAMPLER).toEqual('traceidratio');
+      expect(process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS).toEqual('a,b,c,d');
+      expect(process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED).toEqual('true');
+    });
+  });
+
+  describe('resolveServiceEventsBootstrap()', () => {
+    before(() => {
+      const stub = sinon.stub(opentelemetry.NodeSDK.prototype, 'start');
+      resolveServiceEventsBootstrap = require('../src/register').resolveServiceEventsBootstrap;
+      stub.restore();
+    });
+
+    it('skips on Lambda regardless of other flags', () => {
+      expect(
+        resolveServiceEventsBootstrap({
+          AWS_LAMBDA_FUNCTION_NAME: 'my-fn',
+          OTEL_AWS_SERVICE_EVENTS_ENABLED: 'true',
+          OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true',
+        })
+      ).toEqual({ action: 'skip', reason: 'lambda' });
+    });
+
+    it('initializes when App Signals enabled and ServiceEvents unset (bundled)', () => {
+      expect(resolveServiceEventsBootstrap({ OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true' })).toEqual({
+        action: 'init',
+      });
+    });
+
+    it('skips when App Signals disabled and ServiceEvents unset', () => {
+      expect(resolveServiceEventsBootstrap({})).toEqual({ action: 'skip', reason: 'bundledOff' });
+    });
+
+    it('skips when ServiceEvents explicitly false even with App Signals on', () => {
+      expect(
+        resolveServiceEventsBootstrap({
+          OTEL_AWS_SERVICE_EVENTS_ENABLED: 'false',
+          OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true',
+        })
+      ).toEqual({ action: 'skip', reason: 'explicitOff' });
+    });
+
+    it('force-enabled without App Signals requires both endpoints', () => {
+      expect(
+        resolveServiceEventsBootstrap({
+          OTEL_AWS_SERVICE_EVENTS_ENABLED: 'true',
+          OTEL_AWS_OTLP_LOGS_ENDPOINT: 'http://custom:9999/v1/logs',
+          OTEL_AWS_OTLP_METRICS_ENDPOINT: 'http://custom:9999/v1/metrics',
+        })
+      ).toEqual({ action: 'init' });
+
+      expect(
+        resolveServiceEventsBootstrap({
+          OTEL_AWS_SERVICE_EVENTS_ENABLED: 'true',
+          OTEL_AWS_OTLP_LOGS_ENDPOINT: 'http://custom:9999/v1/logs',
+        })
+      ).toEqual({ action: 'skipForceEnabledWithoutEndpoints' });
+
+      expect(resolveServiceEventsBootstrap({ OTEL_AWS_SERVICE_EVENTS_ENABLED: 'true' })).toEqual({
+        action: 'skipForceEnabledWithoutEndpoints',
+      });
+    });
+
+    it('force-enabled with App Signals: endpoints optional (backfill downstream)', () => {
+      expect(
+        resolveServiceEventsBootstrap({
+          OTEL_AWS_SERVICE_EVENTS_ENABLED: 'true',
+          OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true',
+        })
+      ).toEqual({ action: 'init' });
+    });
+  });
+
+  describe('Healthcheck suppression', () => {
+    it('suppresses /ping for incoming HTTP requests', () => {
+      const { isHttpPingRequest } = require('../src/register');
+      assert.strictEqual(isHttpPingRequest({ url: '/ping' }), true);
+      assert.strictEqual(isHttpPingRequest({ url: '/invocations' }), false);
+      assert.strictEqual(isHttpPingRequest({ url: '/' }), false);
+      assert.strictEqual(isHttpPingRequest({}), false);
+    });
+
+    it('suppresses /ping for undici requests', () => {
+      const { isUndiciPingRequest } = require('../src/register');
+      assert.strictEqual(isUndiciPingRequest({ path: '/ping' }), true);
+      assert.strictEqual(isUndiciPingRequest({ path: '/invocations' }), false);
+      assert.strictEqual(isUndiciPingRequest({ path: '/' }), false);
+    });
+  });
+
+  describe('Dynamic Instrumentation wiring', () => {
+    // register.ts is already required once by the top-level before() hook; re-requiring it
+    // here returns the cached module (no re-execution of its side effects).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    let initializeDynamicInstrumentation: (env: NodeJS.ProcessEnv) => void;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    let shutdownDynamicInstrumentation: () => void;
+    let initStub: sinon.SinonStub;
+    let shutdownStub: sinon.SinonStub;
+    let setTimeoutSpy: sinon.SinonStub;
+
+    beforeEach(() => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const register = require('../src/register');
+      initializeDynamicInstrumentation = register.initializeDynamicInstrumentation;
+      shutdownDynamicInstrumentation = register.shutdownDynamicInstrumentation;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DynamicInstrumentationManager } = require('../src/dynamic-instrumentation');
+      const manager = DynamicInstrumentationManager.getInstance();
+      initStub = sinon.stub(manager, 'initialize');
+      shutdownStub = sinon.stub(manager, 'shutdown');
+      // Stub global setTimeout so the deferred init runs synchronously in-test, WITHOUT
+      // faking the global clock (faking it leaks into other suites' real-timer async tests).
+      setTimeoutSpy = sinon.stub(global, 'setTimeout').callsFake(((fn: () => void) => {
+        fn();
+        return 0 as unknown as NodeJS.Timeout;
+      }) as unknown as typeof setTimeout);
+    });
+
+    afterEach(() => {
+      sinon.restore();
+    });
+
+    it('initializes DI (deferred via setTimeout) when enabled and not in Lambda', () => {
+      initializeDynamicInstrumentation({ OTEL_AWS_DYNAMIC_INSTRUMENTATION_ENABLED: 'true' });
+      assert.strictEqual(setTimeoutSpy.calledOnce, true);
+      assert.strictEqual(setTimeoutSpy.firstCall.args[1], 100); // 100ms defer
+      assert.strictEqual(initStub.calledOnce, true);
+    });
+
+    it('does not initialize DI when the flag is unset (default off)', () => {
+      initializeDynamicInstrumentation({});
+      assert.strictEqual(initStub.called, false);
+      assert.strictEqual(setTimeoutSpy.called, false);
+    });
+
+    it('does not initialize DI when the flag is explicitly false', () => {
+      initializeDynamicInstrumentation({ OTEL_AWS_DYNAMIC_INSTRUMENTATION_ENABLED: 'false' });
+      assert.strictEqual(initStub.called, false);
+    });
+
+    it('does not initialize DI in a Lambda environment even when enabled', () => {
+      initializeDynamicInstrumentation({
+        OTEL_AWS_DYNAMIC_INSTRUMENTATION_ENABLED: 'true',
+        AWS_LAMBDA_FUNCTION_NAME: 'my-fn',
+      });
+      assert.strictEqual(initStub.called, false);
+    });
+
+    it('treats a whitespace/mixed-case true value as enabled', () => {
+      initializeDynamicInstrumentation({ OTEL_AWS_DYNAMIC_INSTRUMENTATION_ENABLED: '  TRUE  ' });
+      assert.strictEqual(initStub.calledOnce, true);
+    });
+
+    it('shutdownDynamicInstrumentation invokes the manager shutdown', () => {
+      shutdownDynamicInstrumentation();
+      assert.strictEqual(shutdownStub.calledOnce, true);
     });
   });
 
@@ -79,7 +601,7 @@ describe('Register', function () {
 
     assert.ok(proc.stdout.includes('AWS Distro of OpenTelemetry automatic instrumentation started successfully'));
     assert.ok(proc.stdout.includes("Environment variable OTEL_EXPORTER_OTLP_PROTOCOL is set to 'http/protobuf'"));
-    assert.ok(proc.stdout.includes("Environment variable OTEL_PROPAGATORS is set to 'xray,tracecontext'"));
+    assert.ok(proc.stdout.includes("Environment variable OTEL_PROPAGATORS is set to 'baggage,xray,tracecontext'"));
 
     // Check a span has been generated for the GET request done in app.js
     assert.ok(proc.stdout.includes("name: 'GET'"), 'console span output in stdout - validate Span Name');
@@ -89,7 +611,7 @@ describe('Register', function () {
     );
 
     // eslint-disable-next-line @typescript-eslint/typedef
-    const packageJson = require('./../../package.json');
+    const packageJson = require('./../package.json');
     const DISTRO_VERSION: string = packageJson.version;
     assert.ok(
       proc.stdout.includes(`'telemetry.auto.version': '${DISTRO_VERSION}-aws'`),

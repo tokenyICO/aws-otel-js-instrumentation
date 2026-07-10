@@ -1,0 +1,22 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# See: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+
+# Format:
+#  - id: <CVE-###>
+#    statement: "<Why are we excluding?> <link to CVE where we can we status>"
+#    expired_at: <required - YYYY-MM-DD>
+
+vulnerabilities:
+  - id: CVE-2026-33036
+    statement: "fast-xml-parser numeric entity expansion DoS. Low risk for ADOT JS: XML parsing only occurs on trusted AWS API responses, not user-supplied input. Fix in PR #369, will ship with next scheduled release. Ticket: V2145663734"
+    expired_at: 2026-06-22
+
+  - id: CVE-2026-44665
+    statement: "fast-xml-builder attribute value quote bypass. Low risk for ADOT JS: XML building only occurs for trusted AWS API request payloads, not user-supplied input. Fix available in 1.1.7."
+    expired_at: 2026-06-22
+
+  - id: CVE-2026-44902
+    statement: "Prometheus exporter process crash via malformed HTTP request. Will be fixed in #425 and released in next scheduled release."
+    expired_at: 2026-06-22

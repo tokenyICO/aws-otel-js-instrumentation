@@ -1,47 +1,69 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Span, TraceFlags, Tracer } from '@opentelemetry/api';
+import { AWSCloudWatchEMFExporter } from '../src/exporter/aws/metrics/aws-cloudwatch-emf-exporter';
+import { propagation, ROOT_CONTEXT, Span, TextMapGetter, trace, TraceFlags, Tracer } from '@opentelemetry/api';
 import { OTLPMetricExporter as OTLPGrpcOTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-grpc';
 import { OTLPMetricExporter as OTLPHttpOTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPTraceExporter as OTLPGrpcTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import { OTLPTraceExporter as OTLPHttpTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { OTLPTraceExporter as OTLPProtoTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import { Resource } from '@opentelemetry/resources';
+import { OTLPLogExporter as OTLPGrpcLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
+import { OTLPLogExporter as OTLPHttpLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
+import { OTLPLogExporter as OTLPProtoLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
+import { emptyResource, resourceFromAttributes } from '@opentelemetry/resources';
 import { PushMetricExporter } from '@opentelemetry/sdk-metrics';
 import {
   AlwaysOffSampler,
+  AlwaysOnSampler,
   BatchSpanProcessor,
+  ParentBasedSampler,
   ReadableSpan,
   SpanProcessor,
   TraceIdRatioBasedSampler,
 } from '@opentelemetry/sdk-trace-base';
-import {
-  AlwaysOnSampler,
-  NodeTracerProvider,
-  ParentBasedSampler,
-  Sampler,
-  SpanExporter,
-} from '@opentelemetry/sdk-trace-node';
+import type { Sampler, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import * as assert from 'assert';
 import expect from 'expect';
 import * as sinon from 'sinon';
+import * as opentelemetry from '@opentelemetry/sdk-node';
 import { AlwaysRecordSampler } from '../src/always-record-sampler';
 import { AttributePropagatingSpanProcessor } from '../src/attribute-propagating-span-processor';
 import { AwsBatchUnsampledSpanProcessor } from '../src/aws-batch-unsampled-span-processor';
 import { AwsMetricAttributesSpanExporter } from '../src/aws-metric-attributes-span-exporter';
 import {
   ApplicationSignalsExporterProvider,
+  AwsLoggerProcessorProvider,
   AwsOpentelemetryConfigurator,
   AwsSpanProcessorProvider,
+  checkEmfExporterEnabled,
+  createEmfExporter,
   customBuildSamplerFromEnv,
+  isAwsOtlpEndpoint,
+  validateAndFetchLogsHeader,
 } from '../src/aws-opentelemetry-configurator';
 import { AwsSpanMetricsProcessor } from '../src/aws-span-metrics-processor';
 import { OTLPUdpSpanExporter } from '../src/otlp-udp-exporter';
-import { setAwsDefaultEnvironmentVariables } from '../src/register';
+let setAwsDefaultEnvironmentVariables: () => void;
 import { AwsXRayRemoteSampler } from '../src/sampler/aws-xray-remote-sampler';
 import { AwsXraySamplingClient } from '../src/sampler/aws-xray-sampling-client';
 import { GetSamplingRulesResponse } from '../src/sampler/remote-sampler.types';
+import { BaggageSpanProcessor } from '@opentelemetry/baggage-span-processor';
+import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
+import { AWS_ATTRIBUTE_KEYS } from '../src/aws-attribute-keys';
+import {
+  BatchLogRecordProcessor,
+  ConsoleLogRecordExporter,
+  LogRecordExporter,
+  SimpleLogRecordProcessor,
+} from '@opentelemetry/sdk-logs';
+import { OTLPAwsLogExporter } from '../src/exporter/otlp/aws/logs/otlp-aws-log-exporter';
+import { OTLPAwsSpanExporter } from '../src/exporter/otlp/aws/traces/otlp-aws-span-exporter';
+import { AwsCloudWatchOtlpBatchLogRecordProcessor } from '../src/exporter/otlp/aws/logs/aws-cw-otlp-batch-log-record-processor';
+import { TRACE_PARENT_HEADER } from '@opentelemetry/core';
+import { ConsoleEMFExporter } from '../src/exporter/aws/metrics/console-emf-exporter';
+import { GenAiNestedClientSpanProcessor } from '../src/gen-ai-nested-client-span-processor';
 
 // Tests AwsOpenTelemetryConfigurator after running Environment Variable setup in register.ts
 describe('AwsOpenTelemetryConfiguratorTest', () => {
@@ -49,6 +71,11 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
 
   // setUpClass
   before(() => {
+    const stub = sinon.stub(opentelemetry.NodeSDK.prototype, 'start');
+    const register = require('../src/register');
+    stub.restore();
+    setAwsDefaultEnvironmentVariables = register.setAwsDefaultEnvironmentVariables;
+
     // Run environment setup in register.ts, then validate expected env values.
     setAwsDefaultEnvironmentVariables();
     validateConfiguratorEnviron();
@@ -69,14 +96,22 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     (awsOtelConfigurator as any).spanProcessors.forEach((spanProcessor: SpanProcessor) => {
       spanProcessor.shutdown();
     });
+
+    delete process.env.OTEL_TRACES_EXPORTER;
+    delete process.env.OTEL_METRICS_EXPORTER;
+    delete process.env.OTEL_LOGS_EXPORTER;
+    delete process.env.OTEL_TRACES_SAMPLER;
+    delete process.env.OTEL_TRACES_SAMPLER_ARG;
   });
 
   // The probability of this passing once without correct IDs is low, 20 times is inconceivable.
   it('ProvideGenerateXrayIdsTest', () => {
-    const tracerProvider: NodeTracerProvider = new NodeTracerProvider(awsOtelConfigurator.configure());
-    tracerProvider.addSpanProcessor(
-      AttributePropagatingSpanProcessor.create((span: ReadableSpan) => '', 'spanNameKey', ['testKey1', 'testKey2'])
-    );
+    const config = awsOtelConfigurator.configure();
+    const spanProcessors = [
+      ...(config.spanProcessors || []),
+      AttributePropagatingSpanProcessor.create((span: ReadableSpan) => '', 'spanNameKey', ['testKey1', 'testKey2']),
+    ];
+    const tracerProvider: NodeTracerProvider = new NodeTracerProvider({ ...config, spanProcessors });
     for (let _: number = 0; _ < 20; _++) {
       const tracer: Tracer = tracerProvider.getTracer('test');
       const startTimeSec: number = Math.floor(new Date().getTime() / 1000.0);
@@ -89,15 +124,165 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     }
   });
 
+  describe('Propagator Extraction', () => {
+    const envVarsToRestore: NodeJS.ProcessEnv = {};
+    beforeEach(() => {
+      for (const [key, value] of Object.entries(process.env)) {
+        if (key.startsWith('OTEL_')) {
+          envVarsToRestore[key] = value;
+          delete process.env[key];
+        }
+      }
+    });
+
+    afterEach(() => {
+      // Clean-up
+      for (const [key, value] of Object.entries(envVarsToRestore)) {
+        process.env[key] = value;
+      }
+    });
+
+    it('Default Propagator extraction of Trace Context works if only X-Ray Trace Header is set', () => {
+      const carrier: Record<string, string> = {
+        'X-Amzn-Trace-Id':
+          'Root=1-5759e988-bd862e3fe1bf46a994270000;Parent=53945c3f42cd0000;Sampled=1;Lineage=a87bd80c:1|68fd508a:5|c512fbe3:2',
+      };
+      const textMapGetter: TextMapGetter = {
+        keys: (carrier: Record<string, string>): string[] => {
+          return Object.keys(carrier);
+        },
+        get: (carrier: Record<string, string>, key: string) => {
+          return carrier?.[key];
+        },
+      };
+
+      // Create configurator with default settings and AgentObservability enabled for this test case
+      setAwsDefaultEnvironmentVariables();
+      const customAwsOtelConfigurator = new AwsOpentelemetryConfigurator([]);
+      const customAwsOtelConfiguration = customAwsOtelConfigurator.configure();
+
+      const tracerProvider: NodeTracerProvider = new NodeTracerProvider(customAwsOtelConfiguration);
+      const tracer: Tracer = tracerProvider.getTracer('test');
+
+      const contextAfterExtraction = customAwsOtelConfiguration.textMapPropagator?.extract(
+        ROOT_CONTEXT,
+        carrier,
+        textMapGetter
+      );
+
+      // Test Trace Context extraction directly
+      const spanContextAfterExtraction = trace.getSpanContext(contextAfterExtraction!);
+      expect(spanContextAfterExtraction?.traceId).toEqual('5759e988bd862e3fe1bf46a994270000');
+      expect(spanContextAfterExtraction?.spanId).toEqual('53945c3f42cd0000');
+      expect(spanContextAfterExtraction?.traceFlags).toEqual(1);
+
+      // Test Trace Context extraction indirectly through span creation
+      const span: Span = tracer.startSpan('test', undefined, contextAfterExtraction);
+      span.end();
+      const spanContext = span.spanContext();
+
+      expect(spanContext.traceId).toEqual('5759e988bd862e3fe1bf46a994270000');
+      // OTel 2.x: parentSpanId moved to parentSpanContext?.spanId
+      expect((span as any).parentSpanContext?.spanId).toEqual('53945c3f42cd0000');
+      expect(spanContext.traceFlags).toEqual(1);
+    });
+
+    it('Default Propagator extraction of Trace Context prioritizes W3C Trace Header over X-Ray Trace Header for span context if they mismatch', () => {
+      const carrier: Record<string, string> = {
+        'X-Amzn-Trace-Id':
+          'Root=1-5759e988-bd862e3fe1bf46a994270000;Parent=53945c3f42cd0000;Sampled=0;Lineage=a87bd80c:1|68fd508a:5|c512fbe3:2',
+        [TRACE_PARENT_HEADER]: '00-11111111222222223333333344444444-5555555566666666-01',
+      };
+      const textMapGetter: TextMapGetter = {
+        keys: (carrier: Record<string, string>): string[] => {
+          return Object.keys(carrier);
+        },
+        get: (carrier: Record<string, string>, key: string) => {
+          return carrier?.[key];
+        },
+      };
+
+      // Create configurator with default settings and AgentObservability enabled for this test case
+      setAwsDefaultEnvironmentVariables();
+      const customAwsOtelConfigurator = new AwsOpentelemetryConfigurator([]);
+      const customAwsOtelConfiguration = customAwsOtelConfigurator.configure();
+
+      const tracerProvider: NodeTracerProvider = new NodeTracerProvider(customAwsOtelConfiguration);
+      const tracer: Tracer = tracerProvider.getTracer('test');
+
+      const contextAfterExtraction = customAwsOtelConfiguration.textMapPropagator?.extract(
+        ROOT_CONTEXT,
+        carrier,
+        textMapGetter
+      );
+
+      // Test Trace Context extraction directly
+      const spanContextAfterExtraction = trace.getSpanContext(contextAfterExtraction!);
+      expect(spanContextAfterExtraction?.traceId).toEqual('11111111222222223333333344444444');
+      expect(spanContextAfterExtraction?.spanId).toEqual('5555555566666666');
+      expect(spanContextAfterExtraction?.traceFlags).toEqual(1);
+
+      // Test Trace Context extraction indirectly through span creation
+      const span: Span = tracer.startSpan('test', undefined, contextAfterExtraction);
+      span.end();
+      const spanContext = span.spanContext();
+
+      expect(spanContext.traceId).toEqual('11111111222222223333333344444444');
+      // OTel 2.x: parentSpanId moved to parentSpanContext?.spanId
+      expect((span as any).parentSpanContext?.spanId).toEqual('5555555566666666');
+      expect(spanContext.traceFlags).toEqual(1);
+    });
+
+    it('Propagator extracts session.id baggage header attribute into to span attributes when Agent Observability is enabled', () => {
+      // Create configurator with default settings and AgentObservability enabled for this test case
+      setAwsDefaultEnvironmentVariables();
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+      const customAwsOtelConfigurator = new AwsOpentelemetryConfigurator([]);
+      const customAwsOtelConfiguration = customAwsOtelConfigurator.configure();
+
+      const tracerProvider: NodeTracerProvider = new NodeTracerProvider(customAwsOtelConfiguration);
+      const tracer: Tracer = tracerProvider.getTracer('test');
+
+      const carrier: Record<string, string> = {
+        baggage: 'session.id=test-adot-js-dev',
+      };
+      const textMapGetter: TextMapGetter = {
+        keys: (carrier: Record<string, string>): string[] => {
+          return Object.keys(carrier);
+        },
+        get: (carrier: Record<string, string>, key: string) => {
+          return carrier?.[key];
+        },
+      };
+      const contextAfterExtraction = customAwsOtelConfiguration.textMapPropagator?.extract(
+        ROOT_CONTEXT,
+        carrier,
+        textMapGetter
+      );
+
+      // Test baggage is set directly
+      const baggageAfterExtraction = propagation.getBaggage(contextAfterExtraction!);
+      expect(baggageAfterExtraction?.getAllEntries().length).toEqual(1);
+      expect(baggageAfterExtraction?.getEntry('session.id')?.value).toEqual('test-adot-js-dev');
+
+      // Test baggage is set indirectly through span creation
+      const span: Span = tracer.startSpan('test', undefined, contextAfterExtraction);
+      span.end();
+      expect((span as any).attributes['session.id']).toEqual('test-adot-js-dev');
+    });
+  });
+
   // Sanity check that the trace ID ratio sampler works fine with the x-ray generator.
   it('TraceIdRatioSamplerTest', () => {
     process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
-    const tracerProvider: NodeTracerProvider = new NodeTracerProvider(awsOtelConfigurator.configure());
+    const config = awsOtelConfigurator.configure();
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
 
-    tracerProvider.addSpanProcessor(
-      AttributePropagatingSpanProcessor.create((span: ReadableSpan) => '', 'spanNameKey', ['testKey1', 'testKey2'])
-    );
+    const spanProcessors = [
+      ...(config.spanProcessors || []),
+      AttributePropagatingSpanProcessor.create((span: ReadableSpan) => '', 'spanNameKey', ['testKey1', 'testKey2']),
+    ];
+    const tracerProvider: NodeTracerProvider = new NodeTracerProvider({ ...config, spanProcessors });
     for (let _: number = 0; _ < 20; _++) {
       const numSpans: number = 100000;
       let numSampled: number = 0;
@@ -116,7 +301,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
 
   it('ImportDefaultSamplerWhenEnvVarIsNotSetTest', () => {
     delete process.env.OTEL_TRACES_SAMPLER;
-    const defaultSampler: Sampler = customBuildSamplerFromEnv(Resource.empty());
+    const defaultSampler: Sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(defaultSampler).not.toBeUndefined();
     expect(defaultSampler.toString()).toEqual(new ParentBasedSampler({ root: new AlwaysOnSampler() }).toString());
@@ -125,7 +310,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
   it('ImportXRaySamplerWhenEnvVarIsSetTest', () => {
     delete process.env.OTEL_TRACES_SAMPLER;
     process.env.OTEL_TRACES_SAMPLER = 'xray';
-    const sampler = customBuildSamplerFromEnv(Resource.empty());
+    const sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(sampler).toBeInstanceOf(AwsXRayRemoteSampler);
     expect((sampler as any)._root._root.awsProxyEndpoint).toEqual('http://localhost:2000');
@@ -140,7 +325,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
 
     process.env.OTEL_TRACES_SAMPLER = 'xray';
     process.env.OTEL_TRACES_SAMPLER_ARG = 'endpoint=http://asdfghjkl:2000,polling_interval=600'; // seconds
-    const sampler = customBuildSamplerFromEnv(Resource.empty());
+    const sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(sampler).toBeInstanceOf(AwsXRayRemoteSampler);
     expect((sampler as any)._root._root.awsProxyEndpoint).toEqual('http://asdfghjkl:2000');
@@ -163,7 +348,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     process.env.OTEL_TRACES_SAMPLER = 'xray';
     process.env.OTEL_TRACES_SAMPLER_ARG = 'endpoint=http://asdfghjkl:2000,polling_interval=FOOBAR';
 
-    const sampler = customBuildSamplerFromEnv(Resource.empty());
+    const sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(sampler).toBeInstanceOf(AwsXRayRemoteSampler);
     expect((sampler as any)._root._root.awsProxyEndpoint).toEqual('http://asdfghjkl:2000');
@@ -195,7 +380,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
       callback({});
     };
 
-    let sampler = customBuildSamplerFromEnv(Resource.empty());
+    let sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(sampler).toBeInstanceOf(AwsXRayRemoteSampler);
     expect((sampler as any)._root._root.awsProxyEndpoint).toEqual('http://lo=cal=host=:2000');
@@ -209,7 +394,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
 
     process.env.OTEL_TRACES_SAMPLER_ARG = 'abc,polling_interval=550,123';
 
-    sampler = customBuildSamplerFromEnv(Resource.empty());
+    sampler = customBuildSamplerFromEnv(emptyResource());
 
     expect(sampler).toBeInstanceOf(AwsXRayRemoteSampler);
     expect((sampler as any)._root._root.awsProxyEndpoint).toEqual('http://localhost:2000');
@@ -262,12 +447,12 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     const mockExporter: SpanExporter = sinon.createStubInstance(AwsMetricAttributesSpanExporter);
     let customizedExporter: SpanExporter = AwsSpanProcessorProvider.customizeSpanExporter(
       mockExporter,
-      Resource.empty()
+      emptyResource()
     );
     expect(mockExporter).toEqual(customizedExporter);
 
     process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
-    customizedExporter = AwsSpanProcessorProvider.customizeSpanExporter(mockExporter, Resource.empty());
+    customizedExporter = AwsSpanProcessorProvider.customizeSpanExporter(mockExporter, emptyResource());
     expect(mockExporter).not.toEqual(customizedExporter);
     expect(customizedExporter).toBeInstanceOf(AwsMetricAttributesSpanExporter);
     expect(mockExporter).toEqual((customizedExporter as any).delegate);
@@ -276,29 +461,33 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
 
   it('CustomizeSpanProcessorsTest', () => {
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
-    const spanProcessors: SpanProcessor[] = [];
-    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
-    expect(spanProcessors.length).toEqual(0);
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+
+    // Test application signals only
+    let spanProcessors: SpanProcessor[] = [];
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
+    expect(spanProcessors.length).toEqual(1);
+    expect(spanProcessors[0]).toBeInstanceOf(BaggageSpanProcessor);
 
     process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
-    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
-    expect(spanProcessors.length).toEqual(2);
-    const firstProcessor: SpanProcessor = spanProcessors[0];
-    expect(firstProcessor).toBeInstanceOf(AttributePropagatingSpanProcessor);
-    const secondProcessor: SpanProcessor = spanProcessors[1];
-    expect(secondProcessor).toBeInstanceOf(AwsSpanMetricsProcessor);
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
+    expect(spanProcessors.length).toEqual(4);
+    expect(spanProcessors[0]).toBeInstanceOf(BaggageSpanProcessor);
+    expect(spanProcessors[1]).toBeInstanceOf(BaggageSpanProcessor);
+    expect(spanProcessors[2]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect(spanProcessors[3]).toBeInstanceOf(AwsSpanMetricsProcessor);
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
 
     try {
       process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
       process.env.OTEL_METRIC_EXPORT_INTERVAL = undefined;
-      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
       process.env.OTEL_METRIC_EXPORT_INTERVAL = '123abc';
-      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
       process.env.OTEL_METRIC_EXPORT_INTERVAL = '!@#$%^&*()';
-      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
       process.env.OTEL_METRIC_EXPORT_INTERVAL = '40000';
-      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
     } catch (e: any) {
       assert.fail(`AwsOpentelemetryConfigurator.customizeSpanProcessors() has incorrectly thrown error: ${e}`);
     } finally {
@@ -310,6 +499,137 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     spanProcessors.forEach(spanProcessor => {
       spanProcessor.shutdown();
     });
+
+    // Reset spanProcessors list for next set of tests
+    spanProcessors = [];
+
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
+    expect(spanProcessors.length).toEqual(4);
+
+    // Verify processors are added in the expected order
+    expect(spanProcessors[0]).toBeInstanceOf(GenAiNestedClientSpanProcessor);
+    expect(spanProcessors[1]).toBeInstanceOf(BaggageSpanProcessor);
+    expect(spanProcessors[2]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect(spanProcessors[3]).toBeInstanceOf(AwsSpanMetricsProcessor);
+
+    // shut down exporters for test cleanup
+    spanProcessors.forEach(spanProcessor => {
+      spanProcessor.shutdown();
+    });
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
+  });
+
+  it('CustomizeSpanProcessorsWithAgentObservabilityTest', () => {
+    const spanProcessorsToTest: SpanProcessor[] = [];
+
+    // Test that only BaggageSpanProcessor is added when agent observability is disabled
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+    expect(spanProcessorsToTest.length).toEqual(1);
+
+    // Verify the added processor is BaggageSpanProcessor
+    const addedProcessor = spanProcessorsToTest[0];
+    expect(addedProcessor).toBeInstanceOf(BaggageSpanProcessor);
+
+    // Clean up
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+  });
+
+  it('BaggageSpanProcessorSessionIdFilteringTest', () => {
+    // Set up agent observability
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+
+    // Create a SpanProcessor list for this test
+    const spanProcessorsToTest: SpanProcessor[] = [];
+
+    // Add our span processors
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+
+    // Verify that the BaggageSpanProcessor was added
+    const baggageProcessors = spanProcessorsToTest.filter(
+      processor => processor.constructor.name === 'BaggageSpanProcessor'
+    );
+    expect(baggageProcessors.length).toBe(1);
+
+    // Verify the predicate function only accepts session.id
+    const baggageProcessor = baggageProcessors[0];
+    expect(baggageProcessor).toBeInstanceOf(BaggageSpanProcessor);
+    const predicate = (baggageProcessor as BaggageSpanProcessor)['_keyPredicate'].bind(baggageProcessor);
+
+    // Test the predicate function directly
+    expect(predicate('session.id')).toBeTruthy();
+    expect(predicate('user.id')).toBeFalsy();
+    expect(predicate('request.id')).toBeFalsy();
+    expect(predicate('other.key')).toBeFalsy();
+    expect(predicate('')).toBeFalsy();
+    expect(predicate('session')).toBeFalsy();
+    expect(predicate('id')).toBeFalsy();
+
+    // Clean up
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+  });
+
+  it('BaggageSpanProcessorCustomKeysTest', () => {
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS = 'user.id, request.id';
+
+    const spanProcessorsToTest: SpanProcessor[] = [];
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+
+    const baggageProcessor = spanProcessorsToTest.find(p => p instanceof BaggageSpanProcessor)!;
+    const predicate = (baggageProcessor as BaggageSpanProcessor)['_keyPredicate'].bind(baggageProcessor);
+
+    expect(predicate('user.id')).toBeTruthy();
+    expect(predicate('request.id')).toBeTruthy();
+    expect(predicate('session.id')).toBeTruthy();
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+  });
+
+  it('BaggageSpanProcessorRejectsKeysWithoutCustomConfigTest', () => {
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+
+    const spanProcessorsToTest: SpanProcessor[] = [];
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+
+    const baggageProcessor = spanProcessorsToTest.find(p => p instanceof BaggageSpanProcessor)!;
+    const predicate = (baggageProcessor as BaggageSpanProcessor)['_keyPredicate'].bind(baggageProcessor);
+
+    expect(predicate('any.key')).toBeFalsy();
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+  });
+
+  it('SessionIdAlwaysAddedWhenAgentObservabilityEnabledTest', () => {
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+    // Without custom baggage keys
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
+    let spanProcessorsToTest: SpanProcessor[] = [];
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+    let baggageProcessor = spanProcessorsToTest.find(p => p instanceof BaggageSpanProcessor)!;
+    let predicate = (baggageProcessor as BaggageSpanProcessor)['_keyPredicate'].bind(baggageProcessor);
+    expect(predicate('session.id')).toBeTruthy();
+
+    // With custom baggage keys
+    process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS = 'custom.key';
+    spanProcessorsToTest = [];
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+    baggageProcessor = spanProcessorsToTest.find(p => p instanceof BaggageSpanProcessor)!;
+    predicate = (baggageProcessor as BaggageSpanProcessor)['_keyPredicate'].bind(baggageProcessor);
+    expect(predicate('session.id')).toBeTruthy();
+    expect(predicate('custom.key')).toBeTruthy();
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_BAGGAGE_SPAN_ATTRIBUTE_KEYS;
   });
 
   it('ApplicationSignalsExporterProviderTest', () => {
@@ -387,10 +707,11 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     expect('my_custom_endpoint').toEqual((exporter as any)._delegate._transport._parameters.address);
 
     // Overwrite protocol back to HTTP, export to url "http://my_custom_endpoint"
+    // OTel 2.x normalizes URLs to include trailing slash
     process.env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL = 'http/protobuf';
     exporter = ApplicationSignalsExporterProvider.Instance.createExporter();
     expect(exporter).toBeInstanceOf(OTLPHttpOTLPMetricExporter);
-    expect('http://my_custom_endpoint').toEqual((exporter as any)._delegate._transport._transport._parameters.url);
+    expect('http://my_custom_endpoint/').toEqual((exporter as any)._delegate._transport._transport._parameters.url);
 
     // Cleanup
     delete process.env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL;
@@ -421,7 +742,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     const mockExporter: SpanExporter = sinon.createStubInstance(OTLPUdpSpanExporter);
     const customizedExporter: SpanExporter = AwsSpanProcessorProvider.customizeSpanExporter(
       mockExporter,
-      Resource.empty()
+      emptyResource()
     );
     // should return UDP exporter for Lambda with AppSignals enabled
     expect((customizedExporter as any).delegate).toBeInstanceOf(OTLPUdpSpanExporter);
@@ -435,7 +756,7 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     const mockExporter: SpanExporter = sinon.createStubInstance(AwsMetricAttributesSpanExporter);
     const customizedExporter: SpanExporter = AwsSpanProcessorProvider.customizeSpanExporter(
       mockExporter,
-      Resource.empty()
+      emptyResource()
     );
     // should still return AwsMetricAttributesSpanExporter for Lambda if AppSignals disabled
     expect(mockExporter).toEqual(customizedExporter);
@@ -481,7 +802,8 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     expect((config.spanProcessors as any)[0]).toBeInstanceOf(BatchSpanProcessor);
     expect((config.spanProcessors as any)[0]._exporter).toBeInstanceOf(OTLPUdpSpanExporter);
     expect((config.spanProcessors as any)[0]._exporter._endpoint).toBe('www.test.com:2222');
-    expect(config.spanProcessors?.length).toEqual(1);
+    expect((config.spanProcessors as any)[1]).toBeInstanceOf(BaggageSpanProcessor);
+    expect(config.spanProcessors?.length).toEqual(2);
 
     delete process.env.AWS_LAMBDA_FUNCTION_NAME;
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
@@ -493,26 +815,25 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED = 'True';
     process.env.AWS_LAMBDA_FUNCTION_NAME = 'TestFunction';
     const spanProcessors: SpanProcessor[] = [];
-    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, Resource.empty());
-    expect(spanProcessors.length).toEqual(2);
-    const firstProcessor: SpanProcessor = spanProcessors[0];
-    expect(firstProcessor).toBeInstanceOf(AttributePropagatingSpanProcessor);
-    const secondProcessor: SpanProcessor = spanProcessors[1];
-    expect(secondProcessor).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
+    AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessors, emptyResource());
+    expect(spanProcessors.length).toEqual(3);
+    expect(spanProcessors[0]).toBeInstanceOf(BaggageSpanProcessor);
+    expect(spanProcessors[1]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect(spanProcessors[2]).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
     delete process.env.AWS_LAMBDA_FUNCTION_NAME;
   });
 
   function validateConfiguratorEnviron() {
     // Set by register.ts
-    expect('http/protobuf').toEqual(process.env.OTEL_EXPORTER_OTLP_PROTOCOL);
-    expect('xray,tracecontext').toEqual(process.env.OTEL_PROPAGATORS);
+    expect(process.env).toHaveProperty('OTEL_EXPORTER_OTLP_PROTOCOL', 'http/protobuf');
+    expect(process.env).toHaveProperty('OTEL_PROPAGATORS', 'baggage,xray,tracecontext');
 
     // Not set
-    expect(undefined).toEqual(process.env.OTEL_TRACES_SAMPLER);
-    expect(undefined).toEqual(process.env.OTEL_TRACES_SAMPLER_ARG);
-    expect(undefined).toEqual(process.env.OTEL_TRACES_EXPORTER);
-    expect(undefined).toEqual(process.env.OTEL_METRICS_EXPORTER);
+    expect(process.env).not.toHaveProperty('OTEL_TRACES_SAMPLER');
+    expect(process.env).not.toHaveProperty('OTEL_TRACES_SAMPLER_ARG');
+    expect(process.env).not.toHaveProperty('OTEL_TRACES_EXPORTER');
+    expect(process.env).not.toHaveProperty('OTEL_METRICS_EXPORTER');
   }
 
   it('OtelTracesSamplerInputValidationTest', () => {
@@ -581,52 +902,101 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     // Default scenario where no trace exporter is specified
     process.env.OTEL_TRACES_EXPORTER = 'none';
     config = new AwsOpentelemetryConfigurator([]).configure();
-    expect((config.spanProcessors as any)[0]).toBeInstanceOf(AttributePropagatingSpanProcessor);
-    expect((config.spanProcessors as any)[1]).toBeInstanceOf(AwsSpanMetricsProcessor);
-    expect(config.spanProcessors?.length).toEqual(2);
+    expect((config.spanProcessors as any)[0]).toBeInstanceOf(BaggageSpanProcessor);
+    expect((config.spanProcessors as any)[1]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect((config.spanProcessors as any)[2]).toBeInstanceOf(AwsSpanMetricsProcessor);
+    expect(config.spanProcessors?.length).toEqual(3);
 
     // Scenario where otlp trace exporter is specified, adds one more exporter compared to default case
     process.env.OTEL_TRACES_EXPORTER = 'otlp';
     config = new AwsOpentelemetryConfigurator([]).configure();
     expect((config.spanProcessors as any)[0]._exporter.delegate).toBeInstanceOf(OTLPProtoTraceExporter);
-    expect((config.spanProcessors as any)[1]).toBeInstanceOf(AttributePropagatingSpanProcessor);
-    expect((config.spanProcessors as any)[2]).toBeInstanceOf(AwsSpanMetricsProcessor);
-    expect(config.spanProcessors?.length).toEqual(3);
+    expect((config.spanProcessors as any)[1]).toBeInstanceOf(BaggageSpanProcessor);
+    expect((config.spanProcessors as any)[2]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect((config.spanProcessors as any)[3]).toBeInstanceOf(AwsSpanMetricsProcessor);
+    expect(config.spanProcessors?.length).toEqual(4);
 
     // Specify invalid exporter, same result as default scenario where no trace exporter is specified
     process.env.OTEL_TRACES_EXPORTER = 'invalid_exporter_name';
     config = new AwsOpentelemetryConfigurator([]).configure();
-    expect((config.spanProcessors as any)[0]).toBeInstanceOf(AttributePropagatingSpanProcessor);
-    expect((config.spanProcessors as any)[1]).toBeInstanceOf(AwsSpanMetricsProcessor);
-    expect(config.spanProcessors?.length).toEqual(2);
+    expect((config.spanProcessors as any)[0]).toBeInstanceOf(BaggageSpanProcessor);
+    expect((config.spanProcessors as any)[1]).toBeInstanceOf(AttributePropagatingSpanProcessor);
+    expect((config.spanProcessors as any)[2]).toBeInstanceOf(AwsSpanMetricsProcessor);
+    expect(config.spanProcessors?.length).toEqual(3);
 
     // Cleanup
     delete process.env.OTEL_AWS_APPLICATION_SIGNALS_ENABLED;
     delete process.env.OTEL_TRACES_EXPORTER;
   });
 
+  it('OtelLogExporterInputValidationTest', () => {
+    let config;
+
+    // Default scenario where no log exporter is specified
+    process.env.OTEL_LOGS_EXPORTER = 'none';
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(0);
+
+    // Scenario where otlp log exporter is specified
+    process.env.OTEL_LOGS_EXPORTER = 'otlp';
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(1);
+    expect((config.logRecordProcessors as any)[0]._exporter).toBeInstanceOf(OTLPProtoLogExporter);
+
+    // Specify invalid exporter, same result as default scenario
+    process.env.OTEL_LOGS_EXPORTER = 'invalid_exporter_name';
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(0);
+
+    // Test console exporter
+    process.env.OTEL_LOGS_EXPORTER = 'console';
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(1);
+    expect((config.logRecordProcessors as any)[0]._exporter).toBeInstanceOf(ConsoleLogRecordExporter);
+
+    // Test AWS OTLP logs endpoint uses OTLPAwsLogExporter
+    process.env.OTEL_LOGS_EXPORTER = 'otlp';
+    process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = 'https://logs.us-east-1.amazonaws.com/v1/logs';
+    process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'x-aws-log-group=my-group,x-aws-log-stream=my-stream';
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(1);
+    expect((config.logRecordProcessors as any)[0]._exporter).toBeInstanceOf(OTLPAwsLogExporter);
+
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+    // Test Agent Observability for AWS OTLP logs endpoint uses OTLPAwsLogExporter and AwsCloudWatchOtlpBatchLogRecordProcessor
+    config = new AwsOpentelemetryConfigurator([]).configure();
+    expect(config.logRecordProcessors?.length).toEqual(1);
+    expect(config.logRecordProcessors![0]).toBeInstanceOf(AwsCloudWatchOtlpBatchLogRecordProcessor);
+    expect((config.logRecordProcessors as any)[0]._exporter).toBeInstanceOf(OTLPAwsLogExporter);
+
+    // Cleanup
+    delete process.env.OTEL_LOGS_EXPORTER;
+    delete process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+    delete process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS;
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+  });
+
   it('ResourceDetectorInputValidationTest', () => {
     let config;
     process.env.OTEL_SERVICE_NAME = 'test_service_name';
 
-    // Default 2 attributes detected in test environment
+    // OTel 2.x: defaultResource() includes additional SDK attributes, so we check for
+    // the presence of expected attributes rather than exact count
     process.env.OTEL_NODE_RESOURCE_DETECTORS = 'container';
     config = new AwsOpentelemetryConfigurator([]).configure();
-    expect(Object.keys((config.resource as any).attributes).length).toEqual(2);
     expect((config.resource as any).attributes['service.name']).toEqual('test_service_name');
     expect((config.resource as any).attributes['telemetry.auto.version'].endsWith('-aws')).toBeTruthy();
 
-    // Still default 2 attributes detected given invalid resource detectors
+    // Still expected attributes detected given invalid resource detectors
     process.env.OTEL_NODE_RESOURCE_DETECTORS = 'invalid_detector_1,invalid_detector_2';
     config = new AwsOpentelemetryConfigurator([]).configure();
-    expect(Object.keys((config.resource as any).attributes).length).toEqual(2);
     expect((config.resource as any).attributes['service.name']).toEqual('test_service_name');
     expect((config.resource as any).attributes['telemetry.auto.version'].endsWith('-aws')).toBeTruthy();
 
-    // Still default 2 attributes detected given mix of valid and invalid resource detectors
+    // Still expected attributes detected given mix of valid and invalid resource detectors
     process.env.OTEL_NODE_RESOURCE_DETECTORS = 'container,invalid_detector_1,invalid_detector_2';
     config = new AwsOpentelemetryConfigurator([]).configure();
-    expect(Object.keys((config.resource as any).attributes).length).toEqual(2);
     expect((config.resource as any).attributes['service.name']).toEqual('test_service_name');
     expect((config.resource as any).attributes['telemetry.auto.version'].endsWith('-aws')).toBeTruthy();
 
@@ -635,36 +1005,607 @@ describe('AwsOpenTelemetryConfiguratorTest', () => {
     delete process.env.OTEL_NODE_RESOURCE_DETECTORS;
   });
 
-  it('AwsSpanProcessorProviderTest', () => {
-    let spanExporter;
+  it('DefaultServiceNameTest', () => {
+    // Ensure OTEL_SERVICE_NAME is not set
+    delete process.env.OTEL_SERVICE_NAME;
+    delete process.env.OTEL_RESOURCE_ATTRIBUTES;
 
-    // Test span exporter configurations via valid environment variables
-    delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL;
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
+    const config = new AwsOpentelemetryConfigurator([]).configure();
+    const serviceName = (config.resource as any).attributes['service.name'];
 
-    process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'grpc';
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPGrpcTraceExporter);
+    // Verify service.name is present and follows the default pattern (unknown_service:<process>)
+    expect(serviceName).toBeDefined();
+    expect(serviceName.startsWith('unknown_service:')).toBe(true);
+  });
 
-    process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/json';
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPHttpTraceExporter);
+  describe('AwsSpanProcessorProviderTest', () => {
+    it('configureOtlp', () => {
+      let spanExporter;
 
-    process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/protobuf';
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
+      // Test span exporter configurations via valid environment variables
+      delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL;
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
 
-    process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'udp';
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPUdpSpanExporter);
+      process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'grpc';
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPGrpcTraceExporter);
 
-    // Test that a default span exporter is configured via invalid environment variable
-    process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'invalid_protocol';
-    spanExporter = AwsSpanProcessorProvider.configureOtlp();
-    expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
+      process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/json';
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPHttpTraceExporter);
+
+      process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/protobuf';
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
+
+      process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'udp';
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPUdpSpanExporter);
+
+      // Test that a default span exporter is configured via invalid environment variable
+      process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'invalid_protocol';
+      spanExporter = AwsSpanProcessorProvider.configureOtlp();
+      expect(spanExporter).toBeInstanceOf(OTLPProtoTraceExporter);
+
+      // Cleanup
+      delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL;
+    });
+
+    it('configureOtlp - OtlpAwsSpanExporter', () => {
+      const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT';
+      const OTEL_TRACES_EXPORTER = 'OTEL_TRACES_EXPORTER';
+
+      const tracesGoodEndpoints = [
+        'https://xray.us-east-1.amazonaws.com/v1/traces',
+        'https://XRAY.US-EAST-1.AMAZONAWS.COM/V1/TRACES',
+        'https://xray.us-east-1.amazonaws.com/v1/traces',
+        'https://XRAY.US-EAST-1.amazonaws.com/v1/traces',
+        'https://xray.US-EAST-1.AMAZONAWS.com/v1/traces',
+        'https://Xray.Us-East-1.amazonaws.com/v1/traces',
+        'https://xRAY.us-EAST-1.amazonaws.com/v1/traces',
+        'https://XRAY.us-EAST-1.AMAZONAWS.com/v1/TRACES',
+        'https://xray.US-EAST-1.amazonaws.com/V1/Traces',
+        'https://xray.us-east-1.AMAZONAWS.COM/v1/traces',
+        'https://XrAy.Us-EaSt-1.AmAzOnAwS.cOm/V1/TrAcEs',
+        'https://xray.US-EAST-1.amazonaws.com/v1/traces',
+        'https://xray.us-east-1.amazonaws.com/V1/TRACES',
+        'https://XRAY.US-EAST-1.AMAZONAWS.COM/v1/traces',
+        'https://xray.us-east-1.AMAZONAWS.COM/V1/traces',
+      ];
+
+      const tracesBadEndpoints = [
+        'http://localhost:4318/v1/traces',
+        'http://xray.us-east-1.amazonaws.com/v1/traces',
+        'ftp://xray.us-east-1.amazonaws.com/v1/traces',
+        'https://ray.us-east-1.amazonaws.com/v1/traces',
+        'https://xra.us-east-1.amazonaws.com/v1/traces',
+        'https://x-ray.us-east-1.amazonaws.com/v1/traces',
+        'https://xray.amazonaws.com/v1/traces',
+        'https://xray.us-east-1.amazon.com/v1/traces',
+        'https://xray.us-east-1.aws.com/v1/traces',
+        'https://xray.us_east_1.amazonaws.com/v1/traces',
+        'https://xray.us.east.1.amazonaws.com/v1/traces',
+        'https://xray..amazonaws.com/v1/traces',
+        'https://xray.us-east-1.amazonaws.com/traces',
+        'https://xray.us-east-1.amazonaws.com/v2/traces',
+        'https://xray.us-east-1.amazonaws.com/v1/trace',
+        'https://xray.us-east-1.amazonaws.com/v1/traces/',
+        'https://xray.us-east-1.amazonaws.com//v1/traces',
+        'https://xray.us-east-1.amazonaws.com/v1//traces',
+        'https://xray.us-east-1.amazonaws.com/v1/traces?param=value',
+        'https://xray.us-east-1.amazonaws.com/v1/traces#fragment',
+        'https://xray.us-east-1.amazonaws.com:443/v1/traces',
+        'https:/xray.us-east-1.amazonaws.com/v1/traces',
+        'https:://xray.us-east-1.amazonaws.com/v1/traces',
+      ];
+
+      const goodConfigs = [];
+      const badConfigs = [];
+
+      // good configurations
+      for (const endpoint of tracesGoodEndpoints) {
+        const config = {
+          [OTEL_TRACES_EXPORTER]: 'otlp',
+          [OTEL_EXPORTER_OTLP_TRACES_ENDPOINT]: endpoint,
+        };
+        goodConfigs.push(config);
+      }
+
+      // bad configurations with bad endpoints
+      for (const endpoint of tracesBadEndpoints) {
+        const config = {
+          [OTEL_TRACES_EXPORTER]: 'otlp',
+          [OTEL_EXPORTER_OTLP_TRACES_ENDPOINT]: endpoint,
+        };
+        badConfigs.push(config);
+      }
+
+      // Test good configurations
+      for (const config of goodConfigs) {
+        customizeExporterTest(config, () => [AwsSpanProcessorProvider.configureOtlp()], OTLPAwsSpanExporter);
+      }
+
+      // Test bad configurations
+      for (const config of badConfigs) {
+        customizeExporterTest(config, () => [AwsSpanProcessorProvider.configureOtlp()], OTLPProtoTraceExporter);
+      }
+    });
+  });
+
+  describe('AwsLoggerProcessorProvider', () => {
+    it('getlogRecordProcessors', () => {
+      process.env.OTEL_LOGS_EXPORTER = 'otlp';
+      let logRecordProcessors = AwsLoggerProcessorProvider.getlogRecordProcessors();
+
+      expect(logRecordProcessors).toHaveLength(1);
+      expect(logRecordProcessors[0]).toBeInstanceOf(BatchLogRecordProcessor);
+
+      process.env.OTEL_LOGS_EXPORTER = 'console';
+      logRecordProcessors = AwsLoggerProcessorProvider.getlogRecordProcessors();
+
+      expect(logRecordProcessors).toHaveLength(1);
+      expect(logRecordProcessors[0]).toBeInstanceOf(SimpleLogRecordProcessor);
+
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+      process.env.OTEL_LOGS_EXPORTER = 'otlp';
+      process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = 'https://logs.us-east-1.amazonaws.com/v1/logs';
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'x-aws-log-group=my-group,x-aws-log-stream=my-stream';
+
+      logRecordProcessors = AwsLoggerProcessorProvider.getlogRecordProcessors();
+
+      expect(logRecordProcessors).toHaveLength(1);
+      expect(logRecordProcessors[0]).toBeInstanceOf(AwsCloudWatchOtlpBatchLogRecordProcessor);
+
+      delete process.env.OTEL_LOGS_EXPORTER;
+      delete process.env.AGENT_OBSERVABILITY_ENABLED;
+      delete process.env.OTEL_LOGS_EXPORTER;
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS;
+    });
+
+    it('configureLogExportersFromEnv', () => {
+      let logsExporter: LogRecordExporter[];
+
+      delete process.env.OTEL_LOGS_EXPORTER;
+      // Test span exporter configurations via valid environment variables
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL;
+      logsExporter = AwsLoggerProcessorProvider.configureLogExportersFromEnv();
+      expect(logsExporter).toHaveLength(1);
+      expect(logsExporter[0]).toBeInstanceOf(OTLPProtoLogExporter);
+
+      process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL = 'http/protobuf';
+      logsExporter = AwsLoggerProcessorProvider.configureLogExportersFromEnv();
+      expect(logsExporter).toHaveLength(1);
+      expect(logsExporter[0]).toBeInstanceOf(OTLPProtoLogExporter);
+
+      process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL = 'grpc';
+      logsExporter = AwsLoggerProcessorProvider.configureLogExportersFromEnv();
+      expect(logsExporter).toHaveLength(1);
+      expect(logsExporter[0]).toBeInstanceOf(OTLPGrpcLogExporter);
+
+      process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL = 'http/json';
+      logsExporter = AwsLoggerProcessorProvider.configureLogExportersFromEnv();
+      expect(logsExporter).toHaveLength(1);
+      expect(logsExporter[0]).toBeInstanceOf(OTLPHttpLogExporter);
+
+      // Test that a default span exporter is configured via invalid environment variable
+      process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL = 'invalid_protocol';
+      logsExporter = AwsLoggerProcessorProvider.configureLogExportersFromEnv();
+      expect(logsExporter).toHaveLength(1);
+      expect(logsExporter[0]).toBeInstanceOf(OTLPProtoLogExporter);
+
+      // Cleanup
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL;
+    });
+
+    it('configureLogExportersFromEnv - OtlpAwsLogsExporter', () => {
+      const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = 'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT';
+      const OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'OTEL_EXPORTER_OTLP_LOGS_HEADERS';
+      const OTEL_LOGS_EXPORTER = 'OTEL_LOGS_EXPORTER';
+
+      const logsGoodEndpoints = [
+        'https://logs.us-east-1.amazonaws.com/v1/logs',
+        'https://LOGS.US-EAST-1.AMAZONAWS.COM/V1/LOGS',
+        'https://logs.us-east-1.amazonaws.com/v1/logs',
+        'https://LOGS.US-EAST-1.amazonaws.com/v1/logs',
+        'https://logs.US-EAST-1.AMAZONAWS.com/v1/logs',
+        'https://Logs.Us-East-1.amazonaws.com/v1/logs',
+        'https://lOGS.us-EAST-1.amazonaws.com/v1/logs',
+        'https://LOGS.us-EAST-1.AMAZONAWS.com/v1/LOGS',
+        'https://logs.US-EAST-1.amazonaws.com/V1/Logs',
+        'https://logs.us-east-1.AMAZONAWS.COM/v1/logs',
+        'https://LoGs.Us-EaSt-1.AmAzOnAwS.cOm/V1/LoGs',
+        'https://logs.US-EAST-1.amazonaws.com/v1/logs',
+        'https://logs.us-east-1.amazonaws.com/V1/LOGS',
+        'https://LOGS.US-EAST-1.AMAZONAWS.COM/v1/logs',
+        'https://logs.us-east-1.AMAZONAWS.COM/V1/logs',
+      ];
+
+      const logsBadEndpoints = [
+        'http://localhost:4318/v1/logs',
+        'http://logs.us-east-1.amazonaws.com/v1/logs',
+        'ftp://logs.us-east-1.amazonaws.com/v1/logs',
+        'https://log.us-east-1.amazonaws.com/v1/logs',
+        'https://logging.us-east-1.amazonaws.com/v1/logs',
+        'https://cloud-logs.us-east-1.amazonaws.com/v1/logs',
+        'https://logs.amazonaws.com/v1/logs',
+        'https://logs.us-east-1.amazon.com/v1/logs',
+        'https://logs.us-east-1.aws.com/v1/logs',
+        'https://logs.us_east_1.amazonaws.com/v1/logs',
+        'https://logs.us.east.1.amazonaws.com/v1/logs',
+        'https://logs..amazonaws.com/v1/logs',
+        'https://logs.us-east-1.amazonaws.com/logs',
+        'https://logs.us-east-1.amazonaws.com/v2/logs',
+        'https://logs.us-east-1.amazonaws.com/v1/log',
+        'https://logs.us-east-1.amazonaws.com/v1/logs/',
+        'https://logs.us-east-1.amazonaws.com//v1/logs',
+        'https://logs.us-east-1.amazonaws.com/v1//logs',
+        'https://logs.us-east-1.amazonaws.com/v1/logs?param=value',
+        'https://logs.us-east-1.amazonaws.com/v1/logs#fragment',
+        'https://logs.us-east-1.amazonaws.com:443/v1/logs',
+        'https:/logs.us-east-1.amazonaws.com/v1/logs',
+        'https:://logs.us-east-1.amazonaws.com/v1/logs',
+        'https://logs.us-east-1.amazonaws.com/v1/logging',
+        'https://logs.us-east-1.amazonaws.com/v1/cloudwatchlogs',
+        'https://logs.us-east-1.amazonaws.com/v1/cwlogs',
+      ];
+
+      const logsBadHeaders = [
+        'x-aws-log-group=,x-aws-log-stream=test',
+        'x-aws-log-group=test,x-aws-log-group=test',
+        'x-aws-log-stream=test,x-aws-log-stream=test',
+        'x-aws-log-stream=test',
+        'x-aws-log-group=test',
+        '',
+      ];
+
+      const goodConfigs = [];
+      const badConfigs = [];
+
+      // good configurations
+      for (const endpoint of logsGoodEndpoints) {
+        const config = {
+          [OTEL_LOGS_EXPORTER]: 'otlp',
+          [OTEL_EXPORTER_OTLP_LOGS_ENDPOINT]: endpoint,
+          [OTEL_EXPORTER_OTLP_LOGS_HEADERS]: 'x-aws-log-group=test,x-aws-log-stream=test',
+        };
+        goodConfigs.push(config);
+      }
+
+      // Cbad configurations with bad endpoints
+      for (const endpoint of logsBadEndpoints) {
+        const config = {
+          [OTEL_LOGS_EXPORTER]: 'otlp',
+          [OTEL_EXPORTER_OTLP_LOGS_ENDPOINT]: endpoint,
+          [OTEL_EXPORTER_OTLP_LOGS_HEADERS]: 'x-aws-log-group=test,x-aws-log-stream=test',
+        };
+        badConfigs.push(config);
+      }
+
+      // bad configurations with bad headers
+      for (const headers of logsBadHeaders) {
+        const config = {
+          [OTEL_LOGS_EXPORTER]: 'otlp',
+          [OTEL_EXPORTER_OTLP_LOGS_ENDPOINT]: 'https://logs.us-east-1.amazonaws.com/v1/logs',
+          [OTEL_EXPORTER_OTLP_LOGS_HEADERS]: headers,
+        };
+        badConfigs.push(config);
+      }
+
+      // Test good configurations
+      for (const config of goodConfigs) {
+        customizeExporterTest(
+          config,
+          () => AwsLoggerProcessorProvider.configureLogExportersFromEnv(),
+          OTLPAwsLogExporter
+        );
+      }
+
+      // Test bad configurations
+      for (const config of badConfigs) {
+        customizeExporterTest(
+          config,
+          () => AwsLoggerProcessorProvider.configureLogExportersFromEnv(),
+          OTLPProtoLogExporter
+        );
+      }
+    });
+  });
+
+  it('ExportUnsampledSpanForAgentObservabilityTest', () => {
+    const spanProcessorsToTest: SpanProcessor[] = [];
+
+    // Test with agent observability disabled
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(spanProcessorsToTest, emptyResource());
+    expect(spanProcessorsToTest).toEqual([]);
+
+    // Test with agent observability enabled
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'https://xray.us-east-1.amazonaws.com/v1/traces';
+
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(spanProcessorsToTest, emptyResource());
+    expect(spanProcessorsToTest.length).toEqual(1);
+
+    const processor = spanProcessorsToTest[0];
+    expect(processor).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
 
     // Cleanup
-    delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL;
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+
+    // Test fallback to OTEL_EXPORTER_OTLP_ENDPOINT
+    const fallbackProcessors: SpanProcessor[] = [];
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'http://localhost:4318';
+
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(fallbackProcessors, emptyResource());
+    expect(fallbackProcessors.length).toEqual(1);
+    expect(fallbackProcessors[0]).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
+    const fallbackExporter = (fallbackProcessors[0] as AwsBatchUnsampledSpanProcessor)['_exporter'];
+    expect(fallbackExporter['endpoint']).toEqual('http://localhost:4318/v1/traces');
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+
+    // Test AWS endpoint via base OTEL_EXPORTER_OTLP_ENDPOINT fallback
+    const awsFallbackProcessors: SpanProcessor[] = [];
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'https://xray.us-west-2.amazonaws.com';
+
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(awsFallbackProcessors, emptyResource());
+    expect(awsFallbackProcessors.length).toEqual(1);
+    expect(awsFallbackProcessors[0]).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
+    const awsFallbackExporter = (awsFallbackProcessors[0] as AwsBatchUnsampledSpanProcessor)['_exporter'];
+    expect(awsFallbackExporter).toBeInstanceOf(OTLPAwsSpanExporter);
+    expect(awsFallbackExporter['endpoint']).toEqual('https://xray.us-west-2.amazonaws.com/v1/traces');
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+
+    // Test precedence: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT wins over OTEL_EXPORTER_OTLP_ENDPOINT
+    const precedenceProcessors: SpanProcessor[] = [];
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'https://xray.us-east-1.amazonaws.com/v1/traces';
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'http://localhost:4318';
+
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(precedenceProcessors, emptyResource());
+    expect(precedenceProcessors.length).toEqual(1);
+    expect(precedenceProcessors[0]).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
+    const precedenceExporter = (precedenceProcessors[0] as AwsBatchUnsampledSpanProcessor)['_exporter'];
+    expect(precedenceExporter).toBeInstanceOf(OTLPAwsSpanExporter);
+    expect(precedenceExporter['endpoint']).toEqual('https://xray.us-east-1.amazonaws.com/v1/traces');
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  });
+
+  it('ExportUnsampledSpanForAgentObservabilityUsesOtlpAwsSpanExporterTest', () => {
+    const spanProcessorsToTest: SpanProcessor[] = [];
+
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'https://xray.us-east-1.amazonaws.com/v1/traces';
+
+    AwsOpentelemetryConfigurator.exportUnsampledSpanForAgentObservability(spanProcessorsToTest, emptyResource());
+
+    // Verify AwsBatchUnsampledSpanProcessor was created with the AWS exporter
+    expect(spanProcessorsToTest[0]).toBeInstanceOf(AwsBatchUnsampledSpanProcessor);
+    const otlpAwsSpanExporter = (spanProcessorsToTest[0] as AwsBatchUnsampledSpanProcessor)['_exporter'];
+
+    // Verify OTLPAwsSpanExporter was created with correct parameters
+    expect(otlpAwsSpanExporter).toBeInstanceOf(OTLPAwsSpanExporter);
+    expect(otlpAwsSpanExporter['endpoint']).toEqual('https://xray.us-east-1.amazonaws.com/v1/traces');
+
+    // Cleanup environment variables
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+  });
+
+  it('CustomizeSpanProcessorsCallsExportUnsampledSpanTest', () => {
+    const spanProcessorsToTest: SpanProcessor[] = [];
+
+    // Create spy for exportUnsampledSpanForAgentObservability
+    const exportUnsampledSpanSpy = sinon.spy(AwsOpentelemetryConfigurator, 'exportUnsampledSpanForAgentObservability');
+
+    try {
+      // Test that function is NOT called when agent observability is disabled
+      delete process.env.AGENT_OBSERVABILITY_ENABLED;
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+      expect(exportUnsampledSpanSpy.called).toBeFalsy();
+
+      // Test that function is called when agent observability is enabled
+      exportUnsampledSpanSpy.resetHistory();
+      process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+      AwsOpentelemetryConfigurator.customizeSpanProcessors(spanProcessorsToTest, emptyResource());
+      expect(exportUnsampledSpanSpy.calledOnce).toBeTruthy();
+      expect(exportUnsampledSpanSpy.calledWith(spanProcessorsToTest, emptyResource())).toBeTruthy();
+    } finally {
+      // Restore original implementation
+      exportUnsampledSpanSpy.restore();
+
+      // Cleanup
+      delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    }
+  });
+
+  it('testCheckEmfExporterEnabled', () => {
+    process.env.OTEL_METRICS_EXPORTER = 'first,awsemf,third';
+    checkEmfExporterEnabled();
+    expect(process.env.OTEL_METRICS_EXPORTER).toEqual('first,third');
+  });
+
+  it('testIsAwsOtlpEndpoint', () => {
+    expect(isAwsOtlpEndpoint('https://xray.us-east-1.amazonaws.com/v1/traces', 'xray')).toBeTruthy();
+    expect(isAwsOtlpEndpoint('https://lambda.us-east-1.amazonaws.com/v1/traces', 'xray')).toBeFalsy();
+    expect(isAwsOtlpEndpoint('https://xray.us-east-1.amazonaws.com/v1/logs', 'xray')).toBeFalsy();
+    expect(isAwsOtlpEndpoint('https://logs.us-east-1.amazonaws.com/v1/logs', 'logs')).toBeTruthy();
+    expect(isAwsOtlpEndpoint('https://lambda.us-east-1.amazonaws.com/v1/logs', 'logs')).toBeFalsy();
+    expect(isAwsOtlpEndpoint('https://logs.us-east-1.amazonaws.com/v1/traces', 'logs')).toBeFalsy();
+  });
+
+  it('testvalidateAndFetchLogsHeader', () => {
+    process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS =
+      'x-aws-log-group=/test/log/group/name,x-aws-log-stream=test_log_stream_name,x-aws-metric-namespace=TEST_NAMESPACE';
+    let headerSettings = validateAndFetchLogsHeader();
+    expect(headerSettings).toEqual({
+      logGroup: '/test/log/group/name',
+      logStream: 'test_log_stream_name',
+      namespace: 'TEST_NAMESPACE',
+      isValid: true,
+    });
+
+    delete process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS;
+    headerSettings = validateAndFetchLogsHeader();
+    expect(headerSettings).toEqual({
+      isValid: false,
+      logGroup: undefined,
+      logStream: undefined,
+      namespace: undefined,
+    });
+  });
+
+  function customizeExporterTest(
+    config: { [x: string]: string },
+    executor: () => LogRecordExporter[] | SpanExporter[],
+    expectedExporterType: { new (...args: any[]): any }
+  ) {
+    for (const key in config) {
+      process.env[key] = config[key];
+    }
+
+    const result = executor();
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBeInstanceOf(expectedExporterType);
+
+    for (const key in config) {
+      delete process.env[key];
+    }
+  }
+
+  it('CustomizeResourceWithoutAgentObservability', () => {
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+
+    let resource = resourceFromAttributes({ [ATTR_SERVICE_NAME]: 'test-service' });
+    resource = awsOtelConfigurator['customizeResource'](resource);
+    expect(resource.attributes[ATTR_SERVICE_NAME]).toEqual('test-service');
+    expect(resource.attributes).not.toHaveProperty(AWS_ATTRIBUTE_KEYS.AWS_SERVICE_TYPE);
+  });
+
+  it('CustomizeResourceWithAgentObservabilityDefault', () => {
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+    let resource = resourceFromAttributes({ [ATTR_SERVICE_NAME]: 'test-service' });
+    resource = awsOtelConfigurator['customizeResource'](resource);
+    expect(resource.attributes[ATTR_SERVICE_NAME]).toEqual('test-service');
+    expect(resource.attributes[AWS_ATTRIBUTE_KEYS.AWS_SERVICE_TYPE]).toEqual('gen_ai_agent');
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+  });
+
+  it('CustomizeResourceWithoutAgentObservability', () => {
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+
+    let resource = resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: 'test-service',
+      [AWS_ATTRIBUTE_KEYS.AWS_SERVICE_TYPE]: 'existing-agent',
+    });
+    resource = awsOtelConfigurator['customizeResource'](resource);
+    expect(resource.attributes[ATTR_SERVICE_NAME]).toEqual('test-service');
+    expect(resource.attributes[AWS_ATTRIBUTE_KEYS.AWS_SERVICE_TYPE]).toEqual('existing-agent');
+
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+  });
+
+  it('DisablesApplicationSignalsDimensionsWhenAgentObservabilityEnabled', () => {
+    // Clean up env vars before test
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS;
+
+    // Verify the env var is not set initially
+    expect(process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS).toBeUndefined();
+
+    // Enable agent observability and create a new configurator
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    new AwsOpentelemetryConfigurator([]);
+
+    // Verify the configurator set the env var to 'false'
+    expect(process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS).toEqual('false');
+
+    // Clean up
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS;
+  });
+
+  it('DoesNotOverrideApplicationSignalsDimensionsWhenExplicitlySet', () => {
+    // Clean up env vars before test
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS;
+
+    // Set the env var explicitly before enabling agent observability
+    process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS = 'true';
+
+    // Enable agent observability and create a new configurator
+    process.env.AGENT_OBSERVABILITY_ENABLED = 'true';
+    new AwsOpentelemetryConfigurator([]);
+
+    // Verify the configurator did NOT override the explicitly set value
+    expect(process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS).toEqual('true');
+
+    // Clean up
+    delete process.env.AGENT_OBSERVABILITY_ENABLED;
+    delete process.env.OTEL_METRICS_ADD_APPLICATION_SIGNALS_DIMENSIONS;
+  });
+
+  describe('Test createEmfExporter', () => {
+    beforeEach(() => {
+      delete process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS;
+      delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+    });
+
+    afterEach(() => {
+      sinon.restore();
+    });
+
+    it('Test createEmfExporter in Lambda with valid headers', () => {
+      process.env.AWS_LAMBDA_FUNCTION_NAME = 'lambdaFunctionName';
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS =
+        'x-aws-log-group=test-group,x-aws-log-stream=test-stream,x-aws-metric-namespace=test-namespace';
+
+      const result = createEmfExporter();
+      expect(result).toBeInstanceOf(AWSCloudWatchEMFExporter);
+    });
+
+    it('creates Console EMF exporter in Lambda with invalid headers', () => {
+      process.env.AWS_LAMBDA_FUNCTION_NAME = 'lambdaFunctionName';
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'x-aws-metric-namespace=test-namespace';
+
+      const result = createEmfExporter();
+      expect(result).toBeInstanceOf(ConsoleEMFExporter);
+    });
+
+    it('creates Console EMF exporter in Lambda with invalid headers and no namespace defaults to "default" namespace', () => {
+      process.env.AWS_LAMBDA_FUNCTION_NAME = 'lambdaFunctionName';
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'nothing=here';
+
+      const result = createEmfExporter();
+      expect(result).toBeInstanceOf(ConsoleEMFExporter);
+      expect(result!['namespace']).toEqual('default');
+    });
+
+    it('creates CloudWatch EMF exporter in non-Lambda environment', () => {
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS =
+        'x-aws-log-group=test-group,x-aws-log-stream=test-stream,x-aws-metric-namespace=test-namespace';
+
+      const result = createEmfExporter();
+      expect(result).toBeInstanceOf(AWSCloudWatchEMFExporter);
+    });
+
+    it('returns undefined when CloudWatch EMF exporter creation fails in non-Lambda environment due to invalid headers', () => {
+      process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'x-aws-log-stream=test-stream';
+
+      const result = createEmfExporter();
+      expect(result).toBeUndefined();
+    });
   });
 });

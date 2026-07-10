@@ -9,18 +9,19 @@ const fetch = require('node-fetch');
 const JSZip = require('jszip');
 
 const { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { DynamoDBClient, CreateTableCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBClient, CreateTableCommand, PutItemCommand, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
 const { SQSClient, CreateQueueCommand, SendMessageCommand, ReceiveMessageCommand } = require('@aws-sdk/client-sqs');
-const { KinesisClient, CreateStreamCommand, PutRecordCommand } = require('@aws-sdk/client-kinesis');
+const { KinesisClient, CreateStreamCommand, PutRecordCommand, DescribeStreamCommand } = require('@aws-sdk/client-kinesis');
 const { BedrockClient, GetGuardrailCommand } = require('@aws-sdk/client-bedrock');
 const { BedrockAgentClient, GetKnowledgeBaseCommand, GetDataSourceCommand, GetAgentCommand } = require('@aws-sdk/client-bedrock-agent');
-const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const { BedrockRuntimeClient, InvokeModelCommand, ConverseCommand, ConverseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { BedrockAgentRuntimeClient, InvokeAgentCommand, RetrieveCommand } = require('@aws-sdk/client-bedrock-agent-runtime');
 const { SNSClient, CreateTopicCommand, GetTopicAttributesCommand } = require('@aws-sdk/client-sns');
 const { SecretsManagerClient, CreateSecretCommand, DescribeSecretCommand } = require('@aws-sdk/client-secrets-manager');
 const { SFNClient, CreateStateMachineCommand, CreateActivityCommand, DescribeStateMachineCommand, DescribeActivityCommand } = require('@aws-sdk/client-sfn');
 const { IAMClient, AttachRolePolicyCommand, CreateRoleCommand } = require('@aws-sdk/client-iam')
 const { LambdaClient, CreateFunctionCommand, GetEventSourceMappingCommand, CreateEventSourceMappingCommand, UpdateEventSourceMappingCommand } = require('@aws-sdk/client-lambda');
+const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand, StartCodeInterpreterSessionCommand, StartBrowserSessionCommand, GetResourceApiKeyCommand, GetMemoryRecordCommand, GetABTestCommand } = require('@aws-sdk/client-bedrock-agentcore');
 
 
 const _PORT = 8080;
@@ -184,6 +185,8 @@ async function handleGetRequest(req, res, path) {
     await handleSqsRequest(req, res, path);
   } else if (path.includes('kinesis')) {
     await handleKinesisRequest(req, res, path);
+  } else if (path.includes('bedrock-agentcore')) {
+    await handleBedrockAgentCoreRequest(req, res, path);
   } else if (path.includes('bedrock')) {
     await handleBedrockRequest(req, res, path);
   } else if (path.includes('secretsmanager')) {
@@ -194,6 +197,8 @@ async function handleGetRequest(req, res, path) {
     await handleSnsRequest(req, res, path);
   } else if (path.includes('lambda')) {
     await handleLambdaRequest(req, res, path);
+  } else if (path.includes('cross-account')) {
+    await handleCrossAccountRequest(req, res, path);
   } else {
     res.writeHead(404);
     res.end();
@@ -383,6 +388,19 @@ async function handleDdbRequest(req, res, path) {
       res.statusCode = 500;
     }
     res.end();
+  } else if (path.includes('describe/some-table')) {
+    try {
+      const response = await ddbClient.send(
+          new DescribeTableCommand({
+            TableName: 'put_test_table'
+          })
+        );
+      res.statusCode = 200;
+    } catch (err) {
+      console.log('Error describing the table', err);
+      res.statusCode = 500;
+    }
+    res.end();
   } else {
     res.statusCode = 404;
     res.end();
@@ -532,10 +550,93 @@ async function handleKinesisRequest(req, res, path) {
       res.statusCode = 500;
     }
     res.end();
+  } else if (path.includes('describe/my-stream')) {
+    try {
+      await kinesisClient.send(
+        new DescribeStreamCommand ({
+          StreamName: 'test_stream',
+          StreamARN: 'arn:aws:kinesis:us-west-2:000000000000:stream/test_stream' 
+        })
+      );
+      res.statusCode = 200;
+    } catch (err) {
+      console.log('Error describing the stream', err);
+      res.statusCode = 500;
+    }
+    res.end();
   } else {
     res.statusCode = 404;
     res.end();
   }
+}
+
+async function handleBedrockAgentCoreRequest(req, res, path) {
+  const agentCoreClient = new BedrockAgentCoreClient({ endpoint: _AWS_SDK_ENDPOINT, region: _AWS_REGION });
+
+  try {
+    if (path.includes('invoke-agent-runtime')) {
+      await withInjected200Success(agentCoreClient, ['InvokeAgentRuntimeCommand'], { runtimeSessionId: 'test-session' }, async () => {
+        await agentCoreClient.send(new InvokeAgentRuntimeCommand({
+          agentRuntimeArn: 'arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/test-runtime-abc123',
+          runtimeSessionId: 'test-session-id-abcdefghijklmnop',
+          payload: '{"prompt": "hello"}',
+          qualifier: 'DEFAULT',
+        }));
+      });
+      res.statusCode = 200;
+    } else if (path.includes('start-code-interpreter')) {
+      await withInjected200Success(agentCoreClient, ['StartCodeInterpreterSessionCommand'], { codeInterpreterIdentifier: 'test-ci-id', sessionId: 'session-123' }, async () => {
+        await agentCoreClient.send(new StartCodeInterpreterSessionCommand({
+          codeInterpreterIdentifier: 'test-ci-id',
+        }));
+      });
+      res.statusCode = 200;
+    } else if (path.includes('start-browser-session')) {
+      await withInjected200Success(agentCoreClient, ['StartBrowserSessionCommand'], { browserIdentifier: 'test-browser-id', sessionId: 'session-456' }, async () => {
+        await agentCoreClient.send(new StartBrowserSessionCommand({
+          browserIdentifier: 'test-browser-id',
+        }));
+      });
+      res.statusCode = 200;
+    } else if (path.includes('get-resource-api-key')) {
+      await withInjected200Success(agentCoreClient, ['GetResourceApiKeyCommand'], { apiKey: 'dummy-key' }, async () => {
+        await agentCoreClient.send(new GetResourceApiKeyCommand({
+          workloadIdentityToken: 'dummy-token',
+          resourceCredentialProviderName: 'my-credential-provider',
+        }));
+      });
+      res.statusCode = 200;
+    } else if (path.includes('get-memory-record')) {
+      await withInjected200Success(agentCoreClient, ['GetMemoryRecordCommand'], { memoryRecord: { memoryRecordId: 'record-123', content: { text: 'test' }, memoryStrategyId: 'strategy-1', namespaces: ['default'], createdAt: new Date() } }, async () => {
+        await agentCoreClient.send(new GetMemoryRecordCommand({
+          memoryId: 'test-memory-id-abc123',
+          memoryRecordId: 'record-123',
+        }));
+      });
+      res.statusCode = 200;
+    } else if (path.includes('get-ab-test')) {
+      await withInjected200Success(agentCoreClient, ['GetABTestCommand'], {
+        abTestId: 'test-ab-test-id',
+        abTestArn: 'arn:aws:bedrock-agentcore:us-west-2:000000000000:ab-test/test-ab-test-id',
+        name: 'test-ab-test',
+        status: 'ACTIVE',
+        executionStatus: 'RUNNING',
+        gatewayArn: 'arn:aws:bedrock-agentcore:us-west-2:000000000000:gateway/test-gateway-abc123',
+        variants: [],
+      }, async () => {
+        await agentCoreClient.send(new GetABTestCommand({
+          abTestId: 'test-ab-test-id',
+        }));
+      });
+      res.statusCode = 200;
+    } else {
+      res.statusCode = 404;
+    }
+  } catch (e) {
+    console.error('Error in bedrock-agentcore handler:', e);
+    res.statusCode = 500;
+  }
+  res.end();
 }
 
 async function handleBedrockRequest(req, res, path) {
@@ -808,6 +909,76 @@ async function handleBedrockRequest(req, res, path) {
       });
 
       res.statusCode = 200;
+    } else if (path.includes('converse/converse')) {
+      const converseResponse = {
+        output: {
+          message: {
+            role: 'assistant',
+            content: [{ text: 'Hello! How can I help you today?' }],
+          },
+        },
+        stopReason: 'end_turn',
+        usage: {
+          inputTokens: 12,
+          outputTokens: 8,
+        },
+      };
+
+      await withInjected200Success(bedrockRuntimeClient, ['ConverseCommand'], converseResponse, async () => {
+        await bedrockRuntimeClient.send(
+          new ConverseCommand({
+            modelId: 'anthropic.claude-v2:1',
+            messages: [
+              {
+                role: 'user',
+                content: [{ text: 'Hello' }],
+              },
+            ],
+            inferenceConfig: {
+              maxTokens: 512,
+              temperature: 0.7,
+              topP: 0.9,
+              stopSequences: ['Human:'],
+            },
+          })
+        );
+      });
+
+      res.statusCode = 200;
+    } else if (path.includes('conversestream/converse-stream')) {
+      const converseStreamResponse = {
+        stream: (async function* () {
+          yield { contentBlockDelta: { delta: { text: 'Hello! ' } } };
+          yield { contentBlockDelta: { delta: { text: 'How can I help?' } } };
+          yield { messageStop: { stopReason: 'end_turn' } };
+          yield { metadata: { usage: { inputTokens: 15, outputTokens: 10 } } };
+        })(),
+      };
+
+      await withInjected200Success(bedrockRuntimeClient, ['ConverseStreamCommand'], converseStreamResponse, async () => {
+        const response = await bedrockRuntimeClient.send(
+          new ConverseStreamCommand({
+            modelId: 'anthropic.claude-v2:1',
+            messages: [
+              {
+                role: 'user',
+                content: [{ text: 'Hello' }],
+              },
+            ],
+            inferenceConfig: {
+              maxTokens: 256,
+              temperature: 0.8,
+              topP: 0.95,
+              stopSequences: ['Assistant:'],
+            },
+          })
+        );
+        for await (const chunk of response.stream) {
+          // consume stream so instrumentation can extract attributes
+        }
+      });
+
+      res.statusCode = 200;
     } else {
       res.statusCode = 404;
     }
@@ -818,7 +989,6 @@ async function handleBedrockRequest(req, res, path) {
 
   res.end();
 }
-
 
 async function handleSecretsRequest(req, res, path) {
   const secretsClient = new SecretsManagerClient({
@@ -1039,6 +1209,35 @@ async function handleLambdaRequest(req, res, path) {
     ); 
   }
   res.end();
+}
+
+async function handleCrossAccountRequest(req, res, path) {
+  const s3Client = new S3Client({
+    endpoint: _AWS_SDK_S3_ENDPOINT,
+    forcePathStyle: true,
+    region: "eu-central-1",
+    credentials: {
+      accessKeyId: "account_b_access_key_id",
+      secretAccessKey: "account_b_secret_access_key",
+      sessionToken: "account_b_token"
+    }
+  });
+
+  if (path.includes('createbucket/account_b')) {
+    try {
+      await s3Client.send(
+        new CreateBucketCommand({
+          Bucket: "cross-account-bucket",
+          CreateBucketConfiguration: { LocationConstraint: "eu-central-1" }
+        })
+      );
+      res.statusCode = 200;
+    } catch (err) {
+      console.log('Error creating a bucket in another account', err);
+      res.statusCode = 500;
+    }
+    res.end();
+  }
 }
 
 async function setupLambda() {

@@ -18,7 +18,7 @@ RUN npm install aws-aws-distro-opentelemetry-node-autoinstrumentation-$(node -p 
 RUN npm install
 
 # Stage 2: Build the cp-utility binary
-FROM public.ecr.aws/docker/library/rust:1.82 as builder
+FROM public.ecr.aws/docker/library/rust:1.87 AS builder
 
 WORKDIR /usr/src/cp-utility
 COPY ./tools/cp-utility .
@@ -36,7 +36,9 @@ ARG TARGETARCH
 RUN if [ $TARGETARCH = "amd64" ]; then rustup component add rustfmt && cargo fmt --check ; fi
 
 # Audit dependencies
-RUN if [ $TARGETARCH = "amd64" ]; then cargo install cargo-audit && cargo audit ; fi
+# Pin cargo-audit: newer releases (>=0.22.2) require a rustc newer than the pinned
+# rust base image above, which breaks the build when cargo-audit floats to latest.
+RUN if [ $TARGETARCH = "amd64" ]; then cargo install cargo-audit --locked --version 0.22.1 && cargo audit ; fi
 
 
 # Cross-compile based on the target platform.
